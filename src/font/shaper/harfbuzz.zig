@@ -5,6 +5,7 @@ const harfbuzz = @import("harfbuzz");
 const font = @import("../main.zig");
 const terminal = @import("../../terminal/main.zig");
 const unicode = @import("../../unicode/main.zig");
+const bidi = @import("../../bidi.zig");
 const Feature = font.shape.Feature;
 const FeatureList = font.shape.FeatureList;
 const default_features = font.shape.default_features;
@@ -145,6 +146,13 @@ pub const Shaper = struct {
                 break :i default_features.len;
             };
 
+            // Always shape LTR. Bidi visual ordering is done at the renderer by
+            // remapping each cell to its visual column (M1). Shaping RTL here
+            // (descending glyph X) breaks the renderer's ascending-X glyph match
+            // and overlaps glyphs. Hebrew has no cursive joining, so LTR shaping
+            // + cell remap renders correctly.
+            self.hb_buf.setDirection(.ltr);
+
             harfbuzz.shape(face.hb_font, self.hb_buf, self.hb_feats[i..]);
         }
 
@@ -274,10 +282,12 @@ pub const Shaper = struct {
 
             self.shaper.codepoints.clearRetainingCapacity();
 
-            // We don't support RTL text because RTL in terminals is messy.
-            // Its something we want to improve. For now, we force LTR because
-            // our renderers assume a strictly increasing X value.
-            self.shaper.hb_buf.setDirection(.ltr);
+            // Note: we intentionally do NOT set the buffer direction here.
+            // A run's resolved bidi direction isn't known until the TextRun
+            // is produced by the iterator, so we set the direction in shape()
+            // right before HarfBuzz runs, using run.direction. We still call
+            // guessSegmentProperties() in finalize() to populate script and
+            // language; shape() then overrides the guessed direction.
         }
 
         pub fn addCodepoint(self: RunIteratorHook, cp: u32, cluster: u32) !void {
@@ -716,11 +726,11 @@ test "shape monaspace ligs" {
     }
 }
 
-// Ghostty doesn't currently support RTL and our renderers assume
-// that cells are in strict LTR order. This means that we need to
-// force RTL text to be LTR for rendering. This test ensures that
-// we are correctly forcing RTL text to be LTR.
-test "shape arabic forced LTR" {
+// When a run is tagged RTL (bidi level is odd), HarfBuzz shapes it
+// M1 shapes everything LTR (ascending X); bidi visual ordering happens at
+// the renderer via cell→visual remap. An RTL run is still tagged
+// direction=.rtl by the iterator, but its shaped glyphs ascend in X.
+test "shape arabic stays LTR-shaped (ascending X) for renderer remap" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
@@ -738,26 +748,25 @@ test "shape arabic forced LTR" {
     defer state.deinit(alloc);
     try state.update(alloc, &t);
 
+    const cells_slice = state.row_data.get(0).cells.slice();
+    const levels = try alloc.alloc(u8, cells_slice.len);
+    defer alloc.free(levels);
+    @memset(levels, 1); // all RTL
+
     var shaper = &testdata.shaper;
     var it = shaper.runIterator(.{
         .grid = testdata.grid,
-        .cells = state.row_data.get(0).cells.slice(),
+        .cells = cells_slice,
+        .bidi_levels = levels,
     });
-    var count: usize = 0;
-    while (try it.next(alloc)) |run| {
-        count += 1;
-        try testing.expectEqual(@as(usize, 25), run.cells);
+    const run = (try it.next(alloc)).?;
+    try testing.expectEqual(bidi.Direction.rtl, run.direction);
 
-        const cells = try shaper.shape(run);
-        try testing.expectEqual(@as(usize, 25), cells.len);
+    const cells = try shaper.shape(run);
+    try testing.expect(cells.len >= 2);
 
-        var x: u16 = cells[0].x;
-        for (cells[1..]) |cell| {
-            try testing.expectEqual(x + 1, cell.x);
-            x = cell.x;
-        }
-    }
-    try testing.expectEqual(@as(usize, 1), count);
+    // LTR-shaped: shaped glyph X is ascending across the run.
+    try testing.expect(cells[0].x < cells[cells.len - 1].x);
 }
 
 test "shape emoji width" {
@@ -2005,6 +2014,55 @@ test "shape cell attribute change" {
         }
         try testing.expectEqual(@as(usize, 1), count);
     }
+}
+
+test "bidi run iterator splits on direction change" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaper(alloc);
+    defer testdata.deinit();
+
+    // "ab" (latin) + U+05D0 U+05D1 (hebrew) + "cd" (latin)
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("ab\u{05D0}\u{05D1}cd");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    // UAX #9 embedding levels parallel to the cells: latin (0), hebrew (1),
+    // latin (0). Even levels are LTR, odd levels are RTL.
+    const levels = [_]u8{ 0, 0, 1, 1, 0, 0 };
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+        .bidi_levels = &levels,
+    });
+
+    // Run 1: "ab" ltr
+    const run1 = (try it.next(alloc)).?;
+    try testing.expectEqual(@as(u16, 2), run1.cells);
+    try testing.expectEqual(.ltr, run1.direction);
+
+    // Run 2: hebrew rtl
+    const run2 = (try it.next(alloc)).?;
+    try testing.expectEqual(@as(u16, 2), run2.cells);
+    try testing.expectEqual(.rtl, run2.direction);
+
+    // Run 3: "cd" ltr
+    const run3 = (try it.next(alloc)).?;
+    try testing.expectEqual(@as(u16, 2), run3.cells);
+    try testing.expectEqual(.ltr, run3.direction);
+
+    // No more runs.
+    try testing.expectEqual(@as(?font.shape.TextRun, null), try it.next(alloc));
 }
 
 const TestShaper = struct {

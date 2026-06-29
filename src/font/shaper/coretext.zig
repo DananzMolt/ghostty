@@ -7,6 +7,7 @@ const font = @import("../main.zig");
 const os = @import("../../os/main.zig");
 const terminal = @import("../../terminal/main.zig");
 const unicode = @import("../../unicode/main.zig");
+const bidi = @import("../../bidi.zig");
 const Feature = font.shape.Feature;
 const FeatureList = font.shape.FeatureList;
 const default_features = font.shape.default_features;
@@ -50,11 +51,6 @@ pub const Shaper = struct {
 
     /// The shared memory used for shaping results.
     cell_buf: CellBuf,
-
-    /// Cached attributes dict for creating CTTypesetter objects.
-    /// The values in this never change so we can avoid overhead
-    /// by just creating it once and saving it for reuse.
-    typesetter_attr_dict: *macos.foundation.Dictionary,
 
     /// List where we cache fonts, so we don't have to remake them for
     /// every single shaping operation.
@@ -172,9 +168,9 @@ pub const Shaper = struct {
         var run_state = RunState.init();
         errdefer run_state.deinit(alloc);
 
-        // For now we only support LTR text. If we shape RTL text then
-        // rendering will be very wrong so we need to explicitly force
-        // LTR no matter what.
+        // We force a per-run embedding level rather than letting CoreText
+        // run its own BiDi. The level is chosen in shape() from the run's
+        // resolved bidi direction (0 = LTR, 1 = RTL).
         //
         // See: https://github.com/mitchellh/ghostty/issues/1737
         // See: https://github.com/mitchellh/ghostty/issues/1442
@@ -190,16 +186,9 @@ pub const Shaper = struct {
         // So instead what we do is use a CTTypesetter to create our line,
         // using the kCTTypesetterOptionForcedEmbeddingLevel attribute to
         // force CoreText not to try doing any sort of BiDi, instead just
-        // treat all text as embedding level 0 (left to right).
-        const typesetter_attr_dict = dict: {
-            const num = try macos.foundation.Number.create(.int, &0);
-            defer num.release();
-            break :dict try macos.foundation.Dictionary.create(
-                &.{macos.c.kCTTypesetterOptionForcedEmbeddingLevel},
-                &.{num},
-            );
-        };
-        errdefer typesetter_attr_dict.release();
+        // treating each run as a single embedding level. The actual level
+        // (0 for LTR, 1 for RTL) is chosen per-run in shape() based on the
+        // run's resolved bidi direction.
 
         // Create the CF release thread.
         var cf_release_thread = try alloc.create(CFReleaseThread);
@@ -221,7 +210,6 @@ pub const Shaper = struct {
             .run_state = run_state,
             .features = features,
             .features_no_default = features_no_default,
-            .typesetter_attr_dict = typesetter_attr_dict,
             .cached_fonts = .{},
             .cached_font_grid = 0,
             .cf_release_pool = .{},
@@ -235,7 +223,6 @@ pub const Shaper = struct {
         self.run_state.deinit(self.alloc);
         self.features.release();
         self.features_no_default.release();
-        self.typesetter_attr_dict.release();
 
         {
             for (self.cached_fonts.items) |ft| {
@@ -381,12 +368,37 @@ pub const Shaper = struct {
         );
         self.cf_release_pool.appendAssumeCapacity(attr_str);
 
-        // Create a typesetter from the attributed string and the cached
-        // attr dict. (See comment in init for more info on the attr dict.)
+        // Build the typesetter options dict for this run. We force the
+        // embedding level based on the run's resolved bidi direction so
+        // CoreText lays out RTL runs right-to-left (level 1) and LTR runs
+        // left-to-right (level 0). Forcing the level (rather than letting
+        // CoreText do its own BiDi) keeps each run single-direction; the
+        // non_ltr sort below normalizes any non-monotonic output.
+        //
+        // See: https://github.com/mitchellh/ghostty/issues/1737
+        // See: https://github.com/mitchellh/ghostty/issues/1442
+        const typesetter_attr_dict = dict: {
+            // Always LTR embedding. RTL cells are fed as single-cell runs (see
+            // run.zig), and a single codepoint can't cluster-merge, so LTR
+            // shaping yields the correct standalone glyph. (RTL embedding here
+            // would trip CoreText's ascending-cluster assumption and collapse
+            // all glyphs onto one cell.)
+            const embedding_level: c_int = 0;
+            const num = try macos.foundation.Number.create(.int, &embedding_level);
+            defer num.release();
+            break :dict try macos.foundation.Dictionary.create(
+                &.{macos.c.kCTTypesetterOptionForcedEmbeddingLevel},
+                &.{num},
+            );
+        };
+        defer typesetter_attr_dict.release();
+
+        // Create a typesetter from the attributed string and our per-run
+        // options dict.
         const typesetter =
             try macos.text.Typesetter.createWithAttributedStringAndOptions(
                 attr_str,
-                self.typesetter_attr_dict,
+                typesetter_attr_dict,
             );
         self.cf_release_pool.appendAssumeCapacity(typesetter);
 
@@ -1963,6 +1975,51 @@ test "shape box glyphs" {
         try testing.expectEqual(@as(u16, 1), cells[1].x);
     }
     try testing.expectEqual(@as(usize, 1), count);
+}
+
+// M1 forces CoreText embedding level 0 (LTR) for all runs; bidi visual
+// ordering is done at the renderer via cell→visual remap. An RTL-tagged run
+// still shapes LTR (ascending X) here.
+test "coretext shape hebrew stays LTR-shaped (ascending X)" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaper(alloc);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 30, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    // ALEF BET GIMEL
+    s.nextSlice("\u{05D0}\u{05D1}\u{05D2}");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    const cells_slice = state.row_data.get(0).cells.slice();
+    const levels = try alloc.alloc(u8, cells_slice.len);
+    defer alloc.free(levels);
+    @memset(levels, 1); // all RTL
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = cells_slice,
+        .bidi_levels = levels,
+    });
+    const run = (try it.next(alloc)).?;
+    try testing.expectEqual(bidi.Direction.rtl, run.direction);
+
+    const cells = try shaper.shape(run);
+    try testing.expect(cells.len >= 2);
+
+    // LTR-shaped (M1): shaped glyph X is ascending; renderer remaps to visual.
+    try testing.expect(cells[0].x < cells[cells.len - 1].x);
 }
 
 test "shape selection boundary" {

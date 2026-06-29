@@ -36,6 +36,10 @@ pub const TextRun = struct {
 
     /// The font index to use for the glyphs of this run.
     font_index: font.Collection.Index,
+
+    /// Resolved visual direction (UAX #9). Defaults to ltr so existing
+    /// behavior is unchanged when bidi is disabled.
+    direction: @import("../../bidi.zig").Direction = .ltr,
 };
 
 /// RunIterator is an iterator that yields text runs.
@@ -97,6 +101,23 @@ pub const RunIterator = struct {
                 if (j > self.i) {
                     if (bounds[0] > 0 and j == bounds[0]) break;
                     if (bounds[1] > 0 and j == bounds[1] + 1) break;
+                }
+            }
+
+            // Bidi run splitting. Break on direction change so each run is
+            // single-direction. Additionally, force RTL cells into their OWN
+            // single-cell runs: ghostty's CoreText shaper can't handle RTL
+            // runs (its cluster/cell-offset logic assumes ascending clusters,
+            // so multi-cell RTL runs either cluster-merge+drop glyphs under
+            // LTR shaping or collapse all glyphs onto one cell under RTL
+            // shaping). A single codepoint can do neither, so we shape each
+            // Hebrew/Arabic cell alone (correct since Hebrew is non-joining)
+            // and the renderer positions it via the bidi visual map.
+            if (self.opts.bidi_levels) |levels| {
+                if (j > self.i and self.i < levels.len) {
+                    const start_rtl = (levels[self.i] & 1) == 1;
+                    if (start_rtl) break; // RTL run = exactly one cell
+                    if (j < levels.len and ((levels[j] & 1) == 1)) break; // LTR run ends at next RTL
                 }
             }
 
@@ -300,6 +321,11 @@ pub const RunIterator = struct {
             .cells = @intCast(j - self.i),
             .grid = self.opts.grid,
             .font_index = current_font,
+            .direction = dir: {
+                const levels = self.opts.bidi_levels orelse break :dir .ltr;
+                if (self.i >= levels.len) break :dir .ltr;
+                break :dir if ((levels[self.i] & 1) == 1) .rtl else .ltr;
+            },
         };
     }
 

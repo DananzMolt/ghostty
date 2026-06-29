@@ -1,0 +1,66 @@
+name: bidi-ci
+
+# Fork-friendly CI using GitHub-hosted runners (macos-14 ships an SDK that
+# zig 0.15.2 can link, unlike the macOS 26 SDK on local dev machines).
+# The stock test.yml uses org-only Namespace runners that don't exist on forks.
+
+on:
+  push:
+    branches: [hebrew-bidi]
+  workflow_dispatch: {}
+
+jobs:
+  test-lib-vt:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - name: Install zig 0.15.2
+        run: |
+          set -euo pipefail
+          curl -fsSL -o zig.tar.xz https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz
+          tar xf zig.tar.xz
+          echo "$PWD/zig-aarch64-macos-0.15.2" >> "$GITHUB_PATH"
+      - name: zig version
+        run: zig version
+      - name: Run lib-vt tests (incl. bidi engine + adapter)
+        run: zig build test-lib-vt
+
+  # Compiles the full app (font shaper + renderer) so shaper/renderer bidi
+  # changes are verified to build, and runs the bidi-related unit tests.
+  # macos-15 (Xcode 16 / SDK 15.x): new enough for ghostty's CoreVideo usage
+  # (kCVPixelFormatType_30RGB_r210), still old enough for zig 0.15.2 to link.
+  build-and-test-app:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - name: Install zig 0.15.2
+        run: |
+          set -euo pipefail
+          curl -fsSL -o zig.tar.xz https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz
+          tar xf zig.tar.xz
+          echo "$PWD/zig-aarch64-macos-0.15.2" >> "$GITHUB_PATH"
+      # Ship build: universal (arm64 + x86_64) ReleaseFast GhosttyKit, no app
+      # signing step (CI can't satisfy it). Universal so colleagues on Intel or
+      # Apple Silicon both work.
+      - name: Build GhosttyKit xcframework (shaper + renderer)
+        run: zig build -Demit-xcframework=true -Demit-macos-app=false -Dxcframework-target=universal -Doptimize=ReleaseFast
+      - name: Run bidi + shaper unit tests
+        run: zig build test -Dtest-filter=bidi
+      - name: Locate + package GhosttyKit.xcframework
+        run: |
+          set -euo pipefail
+          XCF=$(find . -maxdepth 4 -name GhosttyKit.xcframework -type d | head -1)
+          echo "found: $XCF"
+          test -n "$XCF"
+          tar -czf GhosttyKit.xcframework.tar.gz -C "$(dirname "$XCF")" GhosttyKit.xcframework
+          ls -la GhosttyKit.xcframework.tar.gz
+      - name: Upload GhosttyKit artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GhosttyKit-xcframework
+          path: GhosttyKit.xcframework.tar.gz
+          retention-days: 7
