@@ -372,6 +372,11 @@ language: ?[:0]const u8 = null,
 /// Available since: 1.2.0
 @"font-shaping-break": FontShapingBreak = .{},
 
+/// Enable bidirectional (RTL/Hebrew/Arabic) text rendering. Experimental
+/// (Milestone 1: rendering only; cursor and selection in mixed text are not
+/// yet bidi-aware). Defaults to false.
+@"bidi": bool = false,
+
 /// What color space to use when performing alpha blending.
 ///
 /// This affects the appearance of text and of any images with transparency.
@@ -10424,6 +10429,13 @@ test "parse hook: invalid command" {
     var it: TestIterator = .{ .data = &.{"foo"} };
     try testing.expect(try cfg.parseManuallyHook(alloc, "--command", &it));
     try testing.expect(cfg.command == null);
+}
+
+test "bidi config defaults to false" {
+    const testing = std.testing;
+    var cfg = try Config.default(testing.allocator);
+    defer cfg.deinit();
+    try testing.expectEqual(false, cfg.@"bidi");
 }
 
 test "parse e: command only" {

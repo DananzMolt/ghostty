@@ -371,6 +371,8 @@ pub const std_options: std.Options = options: {
 test {
     _ = terminal;
     _ = @import("lib/main.zig");
+    _ = @import("bidi.zig");
+    _ = @import("bidi_unicode.zig");
     @import("std").testing.refAllDecls(input);
     @import("std").testing.refAllDecls(unicode);
     if (comptime terminal.options.c_abi) {

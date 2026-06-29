@@ -84,6 +84,10 @@ pub const RunOptions = struct {
     /// null.
     cursor_x: ?usize = null,
 
+    /// Per-cell UAX #9 embedding levels for this row, parallel to `cells`.
+    /// null disables bidi (run iteration behaves exactly as before).
+    bidi_levels: ?[]const u8 = null,
+
     /// Apply the font break configuration to the run.
     pub fn applyBreakConfig(
         self: *RunOptions,

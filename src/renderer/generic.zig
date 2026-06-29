@@ -13,6 +13,7 @@ const math = @import("../math.zig");
 const Surface = @import("../Surface.zig");
 const link = @import("link.zig");
 const cellpkg = @import("cell.zig");
+const bidi_unicode = @import("../bidi_unicode.zig");
 const noMinContrast = cellpkg.noMinContrast;
 const constraintWidth = cellpkg.constraintWidth;
 const isCovering = cellpkg.isCovering;
@@ -30,6 +31,14 @@ const Health = renderer.Health;
 const getConstraint = @import("../font/nerd_font_attributes.zig").getConstraint;
 
 const FileType = @import("../file_type.zig").FileType;
+
+/// Codepoint used for a cell when resolving a row's bidi order. Cells that
+/// render text contribute their codepoint; empty cells, wide-cell spacers,
+/// and background-only cells contribute a neutral space so that the bidi
+/// indices stay aligned 1:1 with the cell buffer.
+fn cellCodepointForBidi(cell: *const terminal.page.Cell) u21 {
+    return if (cell.hasText()) cell.codepoint() else ' ';
+}
 
 const macos = switch (builtin.os.tag) {
     .macos => @import("macos"),
@@ -647,6 +656,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             font_features: std.ArrayListUnmanaged([:0]const u8),
             font_styles: font.CodepointResolver.StyleStatus,
             font_shaping_break: configpkg.FontShapingBreak,
+            bidi: bool,
             cursor_color: ?configpkg.Config.TerminalColor,
             cursor_opacity: f64,
             cursor_text: ?configpkg.Config.TerminalColor,
@@ -719,6 +729,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .font_features = font_features.list,
                     .font_styles = font_styles,
                     .font_shaping_break = config.@"font-shaping-break",
+                    .bidi = config.@"bidi",
 
                     .cursor_color = config.@"cursor-color",
                     .cursor_text = config.@"cursor-text",
@@ -2962,6 +2973,48 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 },
             };
             run_iter_opts.applyBreakConfig(self.config.font_shaping_break);
+
+            // Bidi: resolve this row's visual order when enabled.
+            var bidi_levels: ?[]const u8 = null;
+            var logical_to_visual: ?[]u16 = null;
+            defer if (logical_to_visual) |m| self.alloc.free(m);
+            defer if (bidi_levels) |lv| self.alloc.free(lv);
+            if (self.config.bidi and cells_len > 0) {
+                // Only reorder the CONTENT portion of the row (up to the last
+                // cell with text). Trailing blank cells keep identity so the
+                // text block stays LEFT-anchored: a Hebrew-dominant line reads
+                // right-to-left but does NOT stick to the terminal's right edge
+                // (which would happen if trailing spaces were part of the
+                // RTL-base reorder).
+                var content_len: usize = 0;
+                for (cells_raw[0..cells_len], 0..) |*c, i| {
+                    if (c.hasText()) content_len = i + 1;
+                }
+                if (content_len > 0) {
+                    const cps = try self.alloc.alloc(u21, content_len);
+                    defer self.alloc.free(cps);
+                    for (cells_raw[0..content_len], 0..) |*c, i| {
+                        cps[i] = cellCodepointForBidi(c);
+                    }
+                    const resolved = bidi_unicode.resolveRow(self.alloc, cps) catch null;
+                    if (resolved) |r| {
+                        // Full-width maps; content span gets the bidi result,
+                        // trailing cells keep identity / LTR.
+                        const l2v = try self.alloc.alloc(u16, cells_len);
+                        for (l2v, 0..) |*v, i| v.* = @intCast(i);
+                        for (r.visual, 0..) |logical_idx, vis| l2v[logical_idx] = @intCast(vis);
+                        const lv = try self.alloc.alloc(u8, cells_len);
+                        @memset(lv, 0);
+                        @memcpy(lv[0..content_len], r.levels);
+                        self.alloc.free(r.visual);
+                        self.alloc.free(r.levels);
+                        bidi_levels = lv; // freed by defer
+                        logical_to_visual = l2v; // freed by defer
+                    }
+                }
+            }
+            run_iter_opts.bidi_levels = bidi_levels;
+
             var run_iter = self.font_shaper.runIterator(run_iter_opts);
             var shaper_run: ?font.shape.TextRun = try run_iter.next(self.alloc);
             var shaper_cells: ?[]const font.shape.Cell = null;
@@ -3306,7 +3359,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // If we encounter a shaper cell to the left of the current
                     // cell then we have some problems. This logic relies on x
                     // position monotonically increasing.
-                    assert(run.offset + shaped_cells[shaper_cells_i].x >= x);
+                    if (run.direction == .ltr) {
+                        assert(run.offset + shaped_cells[shaper_cells_i].x >= x);
+                    }
 
                     // NOTE: An assumption is made here that a single cell will never
                     // be present in more than one shaper run. If that assumption is
@@ -3316,7 +3371,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         run.offset + shaped_cells[shaper_cells_i].x == x) : ({
                         shaper_cells_i += 1;
                     }) {
+                        const draw_x: u16 = if (logical_to_visual) |l2v| l2v[x] else @intCast(x);
                         self.addGlyph(
+                            draw_x,
                             @intCast(x),
                             @intCast(y),
                             state.cols,
@@ -3455,7 +3512,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         // Add a glyph to the specified cell.
         fn addGlyph(
             self: *Self,
+            // Visual screen column where the glyph is drawn (bidi may differ
+            // from logical_x). Used only for grid_pos.
             x: terminal.size.CellCountInt,
+            // Logical cell index into cell_raws for this glyph's attributes
+            // (codepoint, width, constraint). Equals x when bidi is off.
+            logical_x: terminal.size.CellCountInt,
             y: terminal.size.CellCountInt,
             cols: usize,
             cell_raws: []const terminal.page.Cell,
@@ -3464,7 +3526,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             color: terminal.color.RGB,
             alpha: u8,
         ) !void {
-            const cell = cell_raws[x];
+            const cell = cell_raws[logical_x];
             const cp = cell.codepoint();
 
             // Render
@@ -3486,7 +3548,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         } else .none,
                     .constraint_width = constraintWidth(
                         cell_raws,
-                        x,
+                        logical_x,
                         cols,
                     ),
                 },
