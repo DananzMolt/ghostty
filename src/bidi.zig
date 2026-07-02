@@ -52,6 +52,18 @@ pub fn baseDirection(classes: []const Class) Direction {
     return .ltr;
 }
 
+/// True if the row contains any strong RTL character (Hebrew/Arabic, R/AL).
+/// Used by the RTL toggle so that ANY line containing Hebrew is right-anchored
+/// (broader than `baseDirection`, which only right-anchors lines that *start*
+/// with a strong RTL char).
+pub fn containsRtl(classes: []const Class) bool {
+    for (classes) |c| switch (c) {
+        .right_to_left, .right_to_left_arabic => return true,
+        else => {},
+    };
+    return false;
+}
+
 test "baseDirection: first strong char wins" {
     // first strong is L -> ltr (even with later RTL)
     try testing.expectEqual(Direction.ltr, baseDirection(&.{ .left_to_right, .right_to_left, .right_to_left }));
