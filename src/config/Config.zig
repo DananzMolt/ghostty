@@ -377,6 +377,20 @@ language: ?[:0]const u8 = null,
 /// yet bidi-aware). Defaults to false.
 @"bidi": bool = false,
 
+/// Base paragraph direction for bidi rendering (only applies when `bidi` is
+/// true). This is a user-controlled toggle, not derived from content.
+///
+///   * `ltr` - Left-anchored (Latin terminal). Lines stay pinned to the left
+///     edge; RTL runs still reverse internally so words read correctly.
+///   * `rtl` - Right-anchored mirror (Hebrew/Arabic terminal). The line is
+///     mirrored to the right edge and reads right-to-left.
+///
+/// Defaults to `ltr`.
+@"bidi-direction": BidiDirection = .ltr,
+
+/// See `bidi-direction`.
+pub const BidiDirection = enum { ltr, rtl };
+
 /// What color space to use when performing alpha blending.
 ///
 /// This affects the appearance of text and of any images with transparency.
