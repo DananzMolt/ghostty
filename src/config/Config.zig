@@ -388,9 +388,6 @@ language: ?[:0]const u8 = null,
 /// Defaults to `ltr`.
 @"bidi-direction": BidiDirection = .ltr,
 
-/// See `bidi-direction`.
-pub const BidiDirection = enum { ltr, rtl };
-
 /// What color space to use when performing alpha blending.
 ///
 /// This affects the appearance of text and of any images with transparency.
@@ -8675,6 +8672,15 @@ pub const RepeatableLink = struct {
 };
 
 /// Options for copy on select behavior.
+/// See `bidi-direction`.
+pub const BidiDirection = enum {
+    /// Left-anchored (Latin terminal); lines stay pinned to the left edge.
+    ltr,
+    /// Right-anchored mirror (Hebrew/Arabic terminal); the line reads
+    /// right-to-left and is pinned to the right edge.
+    rtl,
+};
+
 pub const CopyOnSelect = enum {
     /// Disables copy on select entirely.
     false,
