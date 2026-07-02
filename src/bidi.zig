@@ -247,19 +247,18 @@ pub const Resolved = struct {
 /// Run the full implicit pipeline (P2/P3 -> levels -> L2) over a sequence of
 /// bidi classes. Pure: operates on classes, not codepoints. Allocates `levels`
 /// and `visual`; the caller frees both.
-pub fn resolveClasses(alloc: std.mem.Allocator, classes: []const Class) !Resolved {
+pub fn resolveClasses(alloc: std.mem.Allocator, classes: []const Class, base: Direction) !Resolved {
     const levels = try alloc.alloc(u8, classes.len);
     errdefer alloc.free(levels);
     const visual = try alloc.alloc(u16, classes.len);
     errdefer alloc.free(visual);
 
-    // Force LTR base: the line is always left-anchored (prompt/cursor at the
-    // left, no right-shift). Bidi still reverses each RTL run internally so
-    // Hebrew/Arabic words render with correct letter order. We deliberately do
-    // NOT pick base from first-strong/majority — that right-anchors the
-    // reading start, which is not what we want in a terminal. `baseDirection`
-    // is kept (and unit-tested) for a possible future explicit RTL toggle.
-    const base: Direction = .ltr;
+    // `base` is the explicit paragraph base direction (set by the caller from
+    // the `bidi-direction` config): .ltr keeps the line left-anchored (Latin
+    // terminal), .rtl right-anchors and mirrors it (Hebrew/Arabic terminal).
+    // Either way, bidi reverses each RTL run internally so words keep correct
+    // letter order. We deliberately do NOT auto-pick base from first-strong;
+    // the direction is a user toggle, not content-derived.
     resolveLevels(classes, base, levels);
     reorder(levels, visual);
 
@@ -270,11 +269,26 @@ test "resolveClasses: all RTL, forced LTR base -> reversed run, visual {2,1,0}" 
     // Forced LTR base. All-RTL row still gets level 1 and is reversed by L2
     // (word reads correctly), but the line stays left-anchored (base ltr).
     const classes = [_]Class{ .right_to_left, .right_to_left, .right_to_left };
-    const res = try resolveClasses(testing.allocator, &classes);
+    const res = try resolveClasses(testing.allocator, &classes, .ltr);
     defer testing.allocator.free(res.levels);
     defer testing.allocator.free(res.visual);
 
     try testing.expectEqual(Direction.ltr, res.base);
     try testing.expectEqualSlices(u8, &.{ 1, 1, 1 }, res.levels);
     try testing.expectEqualSlices(u16, &.{ 2, 1, 0 }, res.visual);
+}
+
+test "resolveClasses: mixed LTR run, RTL base -> level 2 run, right-to-left order" {
+    // RTL base: an embedded LTR run sits at level 2 (even, reads L->R) inside
+    // the level-1 paragraph, and L2 reverses the paragraph so it right-anchors.
+    const classes = [_]Class{ .left_to_right, .left_to_right, .right_to_left };
+    const res = try resolveClasses(testing.allocator, &classes, .rtl);
+    defer testing.allocator.free(res.levels);
+    defer testing.allocator.free(res.visual);
+
+    try testing.expectEqual(Direction.rtl, res.base);
+    try testing.expectEqualSlices(u8, &.{ 2, 2, 1 }, res.levels);
+    // `visual` is visual->logical (visual[pos] = logical drawn there). RTL base
+    // puts the R cell (logical 2) at the left, then the LTR pair in order.
+    try testing.expectEqualSlices(u16, &.{ 2, 0, 1 }, res.visual);
 }

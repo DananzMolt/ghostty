@@ -13,6 +13,7 @@ const math = @import("../math.zig");
 const Surface = @import("../Surface.zig");
 const link = @import("link.zig");
 const cellpkg = @import("cell.zig");
+const bidi = @import("../bidi.zig");
 const bidi_unicode = @import("../bidi_unicode.zig");
 const noMinContrast = cellpkg.noMinContrast;
 const constraintWidth = cellpkg.constraintWidth;
@@ -606,6 +607,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             font_styles: font.CodepointResolver.StyleStatus,
             font_shaping_break: configpkg.FontShapingBreak,
             bidi: bool,
+            bidi_direction: configpkg.Config.BidiDirection,
             cursor_color: ?configpkg.Config.TerminalColor,
             cursor_opacity: f64,
             cursor_text: ?configpkg.Config.TerminalColor,
@@ -679,6 +681,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .font_styles = font_styles,
                     .font_shaping_break = config.@"font-shaping-break",
                     .bidi = config.@"bidi",
+                    .bidi_direction = config.@"bidi-direction",
 
                     .cursor_color = config.@"cursor-color",
                     .cursor_text = config.@"cursor-text",
@@ -2782,12 +2785,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             defer if (logical_to_visual) |m| self.alloc.free(m);
             defer if (bidi_levels) |lv| self.alloc.free(lv);
             if (self.config.bidi and cells_len > 0) {
-                // Only reorder the CONTENT portion of the row (up to the last
-                // cell with text). Trailing blank cells keep identity so the
-                // text block stays LEFT-anchored: a Hebrew-dominant line reads
-                // right-to-left but does NOT stick to the terminal's right edge
-                // (which would happen if trailing spaces were part of the
-                // RTL-base reorder).
+                // Reorder only the CONTENT portion of the row (up to the last
+                // cell with text). The base direction is the user's toggle:
+                //   ltr -> content stays LEFT-anchored, trailing blanks keep
+                //          identity (a Hebrew line reads R->L but does not stick
+                //          to the terminal's right edge).
+                //   rtl -> content is RIGHT-anchored: the content block is
+                //          shifted to the right edge (blanks fill the left) so
+                //          the line mirrors like a native RTL terminal.
+                const base: bidi.Direction = switch (self.config.bidi_direction) {
+                    .ltr => .ltr,
+                    .rtl => .rtl,
+                };
                 var content_len: usize = 0;
                 for (cells_raw[0..cells_len], 0..) |*c, i| {
                     if (c.hasText()) content_len = i + 1;
@@ -2798,16 +2807,33 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     for (cells_raw[0..content_len], 0..) |*c, i| {
                         cps[i] = cellCodepointForBidi(c);
                     }
-                    const resolved = bidi_unicode.resolveRow(self.alloc, cps) catch null;
+                    const resolved = bidi_unicode.resolveRow(self.alloc, cps, base) catch null;
                     if (resolved) |r| {
-                        // Full-width maps; content span gets the bidi result,
-                        // trailing cells keep identity / LTR.
                         const l2v = try self.alloc.alloc(u16, cells_len);
-                        for (l2v, 0..) |*v, i| v.* = @intCast(i);
-                        for (r.visual, 0..) |logical_idx, vis| l2v[logical_idx] = @intCast(vis);
                         const lv = try self.alloc.alloc(u8, cells_len);
                         @memset(lv, 0);
-                        @memcpy(lv[0..content_len], r.levels);
+                        if (base == .rtl) {
+                            // Right-anchor: shift the reordered content block to
+                            // the right edge; trailing logical blanks fill the
+                            // left. offset = free columns to the left.
+                            const offset: u16 = @intCast(cells_len - content_len);
+                            for (r.visual, 0..) |logical_idx, vis| {
+                                l2v[logical_idx] = offset + @as(u16, @intCast(vis));
+                            }
+                            var i: usize = content_len;
+                            while (i < cells_len) : (i += 1) {
+                                l2v[i] = @intCast(i - content_len);
+                            }
+                            // Levels track the content at its logical positions
+                            // (used only for shaping run splits, not position).
+                            @memcpy(lv[0..content_len], r.levels);
+                        } else {
+                            // Left-anchor: content span gets the bidi visual,
+                            // trailing cells keep identity.
+                            for (l2v, 0..) |*v, i| v.* = @intCast(i);
+                            for (r.visual, 0..) |logical_idx, vis| l2v[logical_idx] = @intCast(vis);
+                            @memcpy(lv[0..content_len], r.levels);
+                        }
                         self.alloc.free(r.visual);
                         self.alloc.free(r.levels);
                         bidi_levels = lv; // freed by defer
