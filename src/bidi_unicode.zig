@@ -35,14 +35,16 @@ pub fn resolveRow(alloc: std.mem.Allocator, codepoints: []const u21, base: bidi.
     return bidi.resolveClasses(alloc, classes, base);
 }
 
-/// Like `resolveRow` but picks the base direction per row via UAX#9 P2/P3
-/// (first strong character). A Hebrew/Arabic-first row resolves rtl (and is
-/// right-anchored by the renderer); a Latin-first row resolves ltr (left).
+/// Like `resolveRow` but picks the base direction per row for the RTL toggle:
+/// ANY row containing a Hebrew/Arabic character resolves rtl (right-anchored +
+/// mirrored), so mixed lines like "Broske. מה קורה?" align right too. Rows with
+/// no RTL character stay ltr (left-anchored), so the English CLI is untouched.
 pub fn resolveRowAuto(alloc: std.mem.Allocator, codepoints: []const u21) !bidi.Resolved {
     const classes = try alloc.alloc(bidi.Class, codepoints.len);
     defer alloc.free(classes);
     for (codepoints, 0..) |cp, i| classes[i] = classOf(cp);
-    return bidi.resolveClasses(alloc, classes, bidi.baseDirection(classes));
+    const base: bidi.Direction = if (bidi.containsRtl(classes)) .rtl else .ltr;
+    return bidi.resolveClasses(alloc, classes, base);
 }
 
 test "resolveRow hebrew word reverses" {
@@ -68,19 +70,20 @@ test "resolveRow mixed english hebrew" {
     try testing.expectEqualSlices(u16, &.{ 0, 2, 1, 3 }, r.visual);
 }
 
-test "resolveRowAuto: hebrew-first row resolves rtl base" {
+test "resolveRowAuto: row with any hebrew resolves rtl base (even latin-first)" {
     const testing = std.testing;
     const alloc = testing.allocator;
-    const r = try resolveRowAuto(alloc, &.{ 0x05D0, 0x05D1, ' ', 'a' });
+    // "Broske. <heb>" — starts Latin but contains Hebrew -> right-anchored.
+    const r = try resolveRowAuto(alloc, &.{ 'B', 'r', '.', ' ', 0x05D0, 0x05D1 });
     defer alloc.free(r.levels);
     defer alloc.free(r.visual);
     try testing.expectEqual(bidi.Direction.rtl, r.base);
 }
 
-test "resolveRowAuto: latin-first row resolves ltr base" {
+test "resolveRowAuto: pure-latin row resolves ltr base" {
     const testing = std.testing;
     const alloc = testing.allocator;
-    const r = try resolveRowAuto(alloc, &.{ 'h', 'i', ' ', 0x05D0 });
+    const r = try resolveRowAuto(alloc, &.{ 'h', 'i', ' ', '5', 's' });
     defer alloc.free(r.levels);
     defer alloc.free(r.visual);
     try testing.expectEqual(bidi.Direction.ltr, r.base);
