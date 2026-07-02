@@ -13,7 +13,6 @@ const math = @import("../math.zig");
 const Surface = @import("../Surface.zig");
 const link = @import("link.zig");
 const cellpkg = @import("cell.zig");
-const bidi = @import("../bidi.zig");
 const bidi_unicode = @import("../bidi_unicode.zig");
 const noMinContrast = cellpkg.noMinContrast;
 const constraintWidth = cellpkg.constraintWidth;
@@ -2984,17 +2983,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             defer if (bidi_levels) |lv| self.alloc.free(lv);
             if (self.config.bidi and cells_len > 0) {
                 // Reorder only the CONTENT portion of the row (up to the last
-                // cell with text). The base direction is the user's toggle:
-                //   ltr -> content stays LEFT-anchored, trailing blanks keep
-                //          identity (a Hebrew line reads R->L but does not stick
-                //          to the terminal's right edge).
-                //   rtl -> content is RIGHT-anchored: the content block is
-                //          shifted to the right edge (blanks fill the left) so
-                //          the line mirrors like a native RTL terminal.
-                const base: bidi.Direction = switch (self.config.bidi_direction) {
-                    .ltr => .ltr,
-                    .rtl => .rtl,
-                };
+                // cell with text). The per-row base direction depends on the
+                // user's toggle:
+                //   ltr -> force LTR: every row stays LEFT-anchored (a Hebrew
+                //          run still reads R->L internally but does not stick to
+                //          the right edge). The English TUI is unaffected.
+                //   rtl -> auto (UAX#9 first-strong) per row: a Hebrew/Arabic-
+                //          first row resolves RTL and is RIGHT-anchored/mirrored;
+                //          a Latin-first row stays LTR/left-anchored. So only the
+                //          actual Hebrew lines flip, not the whole CLI.
+                const auto = self.config.bidi_direction == .rtl;
                 var content_len: usize = 0;
                 for (cells_raw[0..cells_len], 0..) |*c, i| {
                     if (c.hasText()) content_len = i + 1;
@@ -3005,12 +3003,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     for (cells_raw[0..content_len], 0..) |*c, i| {
                         cps[i] = cellCodepointForBidi(c);
                     }
-                    const resolved = bidi_unicode.resolveRow(self.alloc, cps, base) catch null;
+                    const resolved = if (auto)
+                        bidi_unicode.resolveRowAuto(self.alloc, cps) catch null
+                    else
+                        bidi_unicode.resolveRow(self.alloc, cps, .ltr) catch null;
                     if (resolved) |r| {
                         const l2v = try self.alloc.alloc(u16, cells_len);
                         const lv = try self.alloc.alloc(u8, cells_len);
                         @memset(lv, 0);
-                        if (base == .rtl) {
+                        if (r.base == .rtl) {
                             // Right-anchor: shift the reordered content block to
                             // the right edge; trailing logical blanks fill the
                             // left. offset = free columns to the left.
