@@ -7,7 +7,11 @@ const uucode = @import("uucode");
 /// Explicit embeddings/overrides/isolates (X-rules, out of M1 scope) and any
 /// unmodeled class fall through to neutral (.other_neutrals).
 pub fn classOf(cp: u21) bidi.Class {
-    return switch (unicode.table.get(cp).bidi_class) {
+    // Bidi_Class comes from uucode's runtime table. Ghostty registers the
+    // field there (see build/uucode_config.zig), so we must not also bake it
+    // into the buildtime props LUT — uucode rejects the same field in two
+    // tables with "duplicate enum field".
+    return switch (uucode.get(.bidi_class, cp)) {
         .left_to_right => .left_to_right,
         .right_to_left => .right_to_left,
         .right_to_left_arabic => .right_to_left_arabic,
