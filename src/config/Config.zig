@@ -8708,7 +8708,6 @@ pub const RepeatableLink = struct {
     }
 };
 
-/// Options for copy on select behavior.
 /// See `bidi-direction`.
 pub const BidiDirection = enum {
     /// Left-anchored (Latin terminal); lines stay pinned to the left edge.
@@ -8718,6 +8717,7 @@ pub const BidiDirection = enum {
     rtl,
 };
 
+/// Options for copy on select behavior.
 pub const CopyOnSelect = enum {
     /// Disables copy on select entirely.
     false,
