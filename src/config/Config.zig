@@ -375,7 +375,7 @@ language: ?[:0]const u8 = null,
 /// Enable bidirectional (RTL/Hebrew/Arabic) text rendering. Experimental
 /// (Milestone 1: rendering only; cursor and selection in mixed text are not
 /// yet bidi-aware). Defaults to false.
-@"bidi": bool = false,
+bidi: bool = false,
 
 /// Base paragraph direction for bidi rendering (only applies when `bidi` is
 /// true). This is a user-controlled toggle, not derived from content.
@@ -10455,7 +10455,7 @@ test "bidi config defaults to false" {
     const testing = std.testing;
     var cfg = try Config.default(testing.allocator);
     defer cfg.deinit();
-    try testing.expectEqual(false, cfg.@"bidi");
+    try testing.expectEqual(false, cfg.bidi);
 }
 
 test "parse e: command only" {

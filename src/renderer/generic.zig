@@ -730,7 +730,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .font_features = font_features.list,
                     .font_styles = font_styles,
                     .font_shaping_break = config.@"font-shaping-break",
-                    .bidi = config.@"bidi",
+                    .bidi = config.bidi,
                     .bidi_direction = config.@"bidi-direction",
 
                     .cursor_color = config.@"cursor-color",
