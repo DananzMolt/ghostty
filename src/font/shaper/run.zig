@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const font = @import("../main.zig");
 const shape = @import("../shape.zig");
 const terminal = @import("../../terminal/main.zig");
+const bidi_mirror = @import("../../bidi_mirror.zig");
 const autoHash = std.hash.autoHash;
 const Hasher = std.hash.Wyhash;
 
@@ -245,6 +246,7 @@ pub const RunIterator = struct {
                     graphemes[j],
                     font_style,
                     presentation,
+                    j,
                 )) |idx| break :font_info .{ .idx = idx };
 
                 // Otherwise we need a fallback character. Prefer the
@@ -288,10 +290,17 @@ pub const RunIterator = struct {
                 continue;
             }
 
-            // Add all the codepoints for our grapheme
+            // Add all the codepoints for our grapheme.
+            //
+            // UAX #9 rule L4: a mirrorable character sitting at an odd (RTL)
+            // embedding level renders as its mirrored form, so "(" becomes ")"
+            // and the prompt ornament U+276F becomes U+276E. Substituting here
+            // rather than at draw time keeps shaping and rendering agreed on
+            // the same glyph, so metrics and the glyph drawn cannot diverge.
+            const base_cp = if (cell.codepoint() == 0) ' ' else cell.codepoint();
             try self.addCodepoint(
                 &hasher,
-                if (cell.codepoint() == 0) ' ' else cell.codepoint(),
+                self.mirroredCodepoint(base_cp, j),
                 @intCast(cluster),
             );
             if (cell.hasGrapheme()) {
@@ -329,6 +338,16 @@ pub const RunIterator = struct {
         };
     }
 
+    /// UAX #9 rule L4. Returns the mirrored form of `cp` when the cell at
+    /// logical index `i` resolved to an odd (RTL) embedding level and the
+    /// codepoint has a Bidi_Mirroring_Glyph; otherwise `cp` unchanged.
+    fn mirroredCodepoint(self: *const RunIterator, cp: u21, i: usize) u21 {
+        const levels = self.opts.bidi_levels orelse return cp;
+        if (i >= levels.len) return cp;
+        if (levels[i] & 1 == 0) return cp;
+        return bidi_mirror.mirror(cp) orelse cp;
+    }
+
     fn addCodepoint(self: *RunIterator, hasher: anytype, cp: u32, cluster: u32) !void {
         autoHash(hasher, cp);
         autoHash(hasher, cluster);
@@ -348,6 +367,9 @@ pub const RunIterator = struct {
         graphemes: []const u21,
         style: font.Style,
         presentation: ?font.Presentation,
+        // Logical cell index, used to apply the same L4 mirroring the shaper
+        // will: the font has to be chosen for the glyph actually drawn.
+        logical_i: usize,
     ) !?font.Collection.Index {
         if (cell.isEmpty() or
             cell.codepoint() == 0 or
@@ -362,7 +384,7 @@ pub const RunIterator = struct {
         }
 
         // Get the font index for the primary codepoint.
-        const primary_cp: u32 = cell.codepoint();
+        const primary_cp: u32 = self.mirroredCodepoint(cell.codepoint(), logical_i);
         const primary = try self.opts.grid.getIndex(
             alloc,
             primary_cp,
