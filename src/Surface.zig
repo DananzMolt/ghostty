@@ -33,6 +33,7 @@ const terminal = @import("terminal/main.zig");
 const configpkg = @import("config.zig");
 const Duration = configpkg.Config.Duration;
 const input = @import("input.zig");
+const bidi_unicode = @import("bidi_unicode.zig");
 const App = @import("App.zig");
 const internal_os = @import("os/main.zig");
 const inspectorpkg = @import("inspector/main.zig");
@@ -3401,11 +3402,52 @@ pub fn keyCallback(
 /// Maybe handles a binding for a given event and if so returns the effect.
 /// Returns null if the event is not handled in any way and processing should
 /// continue.
+/// Mirror a horizontal arrow before binding lookup when the cursor's row is
+/// drawn right-to-left.
+///
+/// The plain arrows are mirrored when the key is encoded, but the modified ones
+/// resolve as keybindings first and never reach that code. On macOS ghostty
+/// binds them to fixed sequences - alt+left sends ESC b (word back), super+left
+/// sends \x01 (line start) - so without this they move opposite to the arrow on
+/// a mirrored row.
+///
+/// The mirrored binding is only used when it emits text. That deliberately
+/// leaves super+alt+arrow alone: it moves pane focus, and panes follow the
+/// physical screen rather than the text.
+fn bidiMirroredBindingEvent(self: *Surface, event: input.KeyEvent) input.KeyEvent {
+    if (!self.config.bidi_swap_arrows) return event;
+    const mirrored_key: input.Key = switch (event.key) {
+        .arrow_left => .arrow_right,
+        .arrow_right => .arrow_left,
+        else => return event,
+    };
+
+    var mirrored = event;
+    mirrored.key = mirrored_key;
+    const entry = self.config.keybind.set.getEvent(mirrored) orelse return event;
+    const leaf = switch (entry.value_ptr.*) {
+        .leaf => |l| l,
+        .leader, .leaf_chained => return event,
+    };
+    switch (leaf.action) {
+        .text, .esc, .csi => {},
+        else => return event,
+    }
+
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        if (!self.cursorRowIsRtl()) return event;
+    }
+    return mirrored;
+}
+
 fn maybeHandleBinding(
     self: *Surface,
-    event: input.KeyEvent,
+    event_: input.KeyEvent,
     insp_ev: ?*inspectorpkg.KeyEvent,
 ) !?InputEffect {
+    const event = self.bidiMirroredBindingEvent(event_);
     switch (event.action) {
         // Release events never trigger a binding but we need to check if
         // we consumed the press event so we don't encode the release.
@@ -3813,13 +3855,48 @@ fn encodeKey(
     return write_req;
 }
 
+/// Whether the row the cursor sits on is drawn right-to-left.
+///
+/// The arrows mirror only on rows that are actually mirrored. A blanket swap
+/// whenever the direction toggle is on reverses the arrows in Latin text too,
+/// which is wrong: an English line is still drawn left-to-right.
+///
+/// This resolves the row exactly the way the renderer does when it decides
+/// whether to right-anchor, so the arrows always agree with what is on screen.
+/// Caller must already hold the renderer mutex.
+fn cursorRowIsRtl(self: *const Surface) bool {
+    const screen = self.io.terminal.screens.active;
+    const cells = screen.cursor.page_pin.cells(.all);
+    if (cells.len == 0) return false;
+
+    // Only the content matters; trailing blanks carry no direction.
+    var content_len: usize = 0;
+    for (cells, 0..) |*c, i| {
+        if (c.hasText()) content_len = i + 1;
+    }
+    if (content_len == 0) return false;
+
+    var buf: [256]u21 = undefined;
+    const len = @min(content_len, buf.len);
+    for (cells[0..len], 0..) |*c, i| {
+        buf[i] = if (c.hasText()) c.codepoint() else ' ';
+    }
+
+    const resolved = bidi_unicode.resolveRowAuto(self.alloc, buf[0..len]) catch return false;
+    defer {
+        self.alloc.free(resolved.visual);
+        self.alloc.free(resolved.levels);
+    }
+    return resolved.base == .rtl;
+}
+
 fn encodeKeyOpts(self: *const Surface) input.key_encode.Options {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
     const t = &self.io.terminal;
 
     var opts: input.key_encode.Options = .fromTerminal(t);
-    opts.bidi_swap_arrows = self.config.bidi_swap_arrows;
+    opts.bidi_swap_arrows = self.config.bidi_swap_arrows and self.cursorRowIsRtl();
     if (comptime builtin.os.tag != .macos) return opts;
 
     opts.macos_option_as_alt = self.config.macos_option_as_alt orelse detect: {

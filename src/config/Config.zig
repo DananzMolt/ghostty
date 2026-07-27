@@ -4640,15 +4640,6 @@ fn loadTheme(self: *Config, theme: Theme) !void {
 /// Call this once after you are done setting configuration. This
 /// is idempotent but will waste memory if called multiple times.
 pub fn finalize(self: *Config) !void {
-    // A mirrored display flips the horizontal arrows. The plain arrows are
-    // handled when the key is encoded, but the modified ones are keybindings
-    // that emit fixed sequences (alt+left -> ESC b, super+left -> \x01), which
-    // never reach the encoder, so exchange those here. Done after the user's
-    // config is parsed so it also covers any text bindings they added.
-    if (self.bidi and self.@"bidi-direction" == .rtl) {
-        try self.keybind.set.swapHorizontalTextArrows(self._arena.?.allocator());
-    }
-
     // We always load the theme first because it may set other fields
     // in our config.
     if (self.theme) |theme| {
