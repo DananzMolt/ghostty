@@ -410,6 +410,9 @@ const DerivedConfig = struct {
     fullscreen: configpkg.Fullscreen,
     macos_non_native_fullscreen: configpkg.NonNativeFullscreen,
     macos_option_as_alt: ?input.OptionAsAlt,
+    /// True when the display is mirrored, so the horizontal arrow keys are
+    /// swapped to follow the text as drawn. See key_encode.Options.
+    bidi_swap_arrows: bool,
     selection_clear_on_copy: bool,
     selection_clear_on_typing: bool,
     selection_word_chars: []const u21,
@@ -495,6 +498,7 @@ const DerivedConfig = struct {
             .fullscreen = config.fullscreen,
             .macos_non_native_fullscreen = config.@"macos-non-native-fullscreen",
             .macos_option_as_alt = config.@"macos-option-as-alt",
+            .bidi_swap_arrows = config.bidi and config.@"bidi-direction" == .rtl,
             .selection_clear_on_copy = config.@"selection-clear-on-copy",
             .selection_clear_on_typing = config.@"selection-clear-on-typing",
             .selection_word_chars = try alloc.dupe(u21, config.@"selection-word-chars".codepoints),
@@ -3815,6 +3819,7 @@ fn encodeKeyOpts(self: *const Surface) input.key_encode.Options {
     const t = &self.io.terminal;
 
     var opts: input.key_encode.Options = .fromTerminal(t);
+    opts.bidi_swap_arrows = self.config.bidi_swap_arrows;
     if (comptime builtin.os.tag != .macos) return opts;
 
     opts.macos_option_as_alt = self.config.macos_option_as_alt orelse detect: {

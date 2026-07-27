@@ -42,6 +42,15 @@ pub const Options = struct {
     /// docs for a more detailed description of why this is needed.
     macos_option_as_alt: OptionAsAlt = .false,
 
+    /// Reverse the horizontal arrow keys, for a mirrored (RTL) display.
+    ///
+    /// The application on the other end only knows logical positions, so a
+    /// left arrow always means "one position back". When the row is mirrored
+    /// that moves the cursor visually RIGHT, which is backwards from what the
+    /// key says. Swapping the sequence here makes the arrows follow the text
+    /// as it is actually drawn.
+    bidi_swap_arrows: bool = false,
+
     pub const default: Options = .{
         .cursor_key_application = false,
         .keypad_key_application = false,
@@ -81,9 +90,18 @@ pub const Options = struct {
 /// they care about that.
 pub fn encode(
     writer: *std.Io.Writer,
-    event: key.KeyEvent,
+    event_: key.KeyEvent,
     opts: Options,
 ) std.Io.Writer.Error!void {
+    // UAX #9 display order is mirrored, so the horizontal arrows are too. See
+    // Options.bidi_swap_arrows.
+    var event = event_;
+    if (opts.bidi_swap_arrows) switch (event.key) {
+        .arrow_left => event.key = .arrow_right,
+        .arrow_right => event.key = .arrow_left,
+        else => {},
+    };
+
     //std.log.warn("KEYENCODER event={} opts={}", .{ event, opts });
     return if (opts.kitty_flags.int() != 0) try kitty(
         writer,
@@ -2560,4 +2578,75 @@ test "ctrlseq: right ctrl c" {
         .sides = .{ .ctrl = .right },
     });
     try testing.expectEqual(@as(u8, 0x03), seq.?);
+}
+
+test "bidi_swap_arrows: left and right are exchanged" {
+    var buf: [128]u8 = undefined;
+
+    // Baseline: without the option the arrows encode normally.
+    {
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, .{ .key = .arrow_left }, .{});
+        try testing.expectEqualStrings("\x1b[D", writer.buffered());
+    }
+    {
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, .{ .key = .arrow_right }, .{});
+        try testing.expectEqualStrings("\x1b[C", writer.buffered());
+    }
+
+    // Mirrored display: pressing left must send the sequence that advances
+    // through the text, because in an RTL run "forward" is drawn leftwards.
+    {
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, .{ .key = .arrow_left }, .{ .bidi_swap_arrows = true });
+        try testing.expectEqualStrings("\x1b[C", writer.buffered());
+    }
+    {
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, .{ .key = .arrow_right }, .{ .bidi_swap_arrows = true });
+        try testing.expectEqualStrings("\x1b[D", writer.buffered());
+    }
+}
+
+test "bidi_swap_arrows: vertical arrows and other keys are untouched" {
+    var buf: [128]u8 = undefined;
+    {
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, .{ .key = .arrow_up }, .{ .bidi_swap_arrows = true });
+        try testing.expectEqualStrings("\x1b[A", writer.buffered());
+    }
+    {
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, .{ .key = .arrow_down }, .{ .bidi_swap_arrows = true });
+        try testing.expectEqualStrings("\x1b[B", writer.buffered());
+    }
+}
+
+test "bidi_swap_arrows: applies with modifiers and in kitty mode" {
+    var buf: [128]u8 = undefined;
+
+    // Modified arrows go through the same swap, so word-wise movement
+    // (alt+arrow) follows the display too.
+    {
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, .{
+            .key = .arrow_left,
+            .mods = .{ .alt = true },
+        }, .{ .bidi_swap_arrows = true });
+        const out = writer.buffered();
+        try testing.expect(std.mem.endsWith(u8, out, "C"));
+    }
+
+    // Kitty encoding reports the keycode, so the swap must reach it as well
+    // or the application would see the unswapped key.
+    {
+        var writer: std.Io.Writer = .fixed(&buf);
+        try encode(&writer, .{ .key = .arrow_left }, .{
+            .bidi_swap_arrows = true,
+            .kitty_flags = .{ .disambiguate = true },
+        });
+        const out = writer.buffered();
+        try testing.expect(std.mem.endsWith(u8, out, "C"));
+    }
 }
