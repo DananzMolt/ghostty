@@ -53,6 +53,81 @@ const BidiCursorRemap = struct {
     visual_x: ?terminal.size.CellCountInt = null,
 };
 
+/// A row's resolved bidi order: where each logical cell is drawn, plus the
+/// embedding levels used to split shaping runs.
+const BidiRowMap = struct {
+    /// logical cell index -> visual screen column. Covers the whole row width,
+    /// not just the content, so the cursor can be placed even when it sits
+    /// past the last typed character.
+    logical_to_visual: []u16,
+    /// Embedding levels at logical positions. Only the content span is set.
+    levels: []u8,
+
+    fn deinit(self: BidiRowMap, alloc: std.mem.Allocator) void {
+        alloc.free(self.logical_to_visual);
+        alloc.free(self.levels);
+    }
+};
+
+/// Resolve one row's bidi order into a full-width logical->visual map.
+///
+/// `cps` is the row's content (up to the last cell with text); `cells_len` is
+/// the whole row width. `auto` selects the base direction: false forces LTR so
+/// the row stays left-anchored, true resolves per-row by UAX #9 first-strong so
+/// only genuinely RTL rows mirror.
+///
+/// Returns null when the bidi resolver fails, which the caller treats as "no
+/// reordering" rather than an error.
+fn bidiRowMap(
+    alloc: std.mem.Allocator,
+    cps: []const u21,
+    cells_len: usize,
+    auto: bool,
+) !?BidiRowMap {
+    const content_len = cps.len;
+    if (content_len == 0 or cells_len == 0) return null;
+
+    const resolved = if (auto)
+        bidi_unicode.resolveRowAuto(alloc, cps) catch return null
+    else
+        bidi_unicode.resolveRow(alloc, cps, .ltr) catch return null;
+    defer {
+        alloc.free(resolved.visual);
+        alloc.free(resolved.levels);
+    }
+
+    const l2v = try alloc.alloc(u16, cells_len);
+    errdefer alloc.free(l2v);
+    const lv = try alloc.alloc(u8, cells_len);
+    errdefer alloc.free(lv);
+    @memset(lv, 0);
+
+    if (resolved.base == .rtl) {
+        // Right-anchor: shift the reordered content block to the right edge.
+        // offset = free columns to its left.
+        const offset: u16 = @intCast(cells_len - content_len);
+        for (resolved.visual, 0..) |logical_idx, vis| {
+            l2v[logical_idx] = offset + @as(u16, @intCast(vis));
+        }
+        // The trailing blanks continue the mirror, running right-to-left away
+        // from the content: the first blank after the text sits immediately to
+        // its LEFT, not at column 0. This is what puts the cursor beside the
+        // text in an RTL row.
+        var i: usize = content_len;
+        while (i < cells_len) : (i += 1) {
+            l2v[i] = @intCast(offset - 1 - (i - content_len));
+        }
+    } else {
+        // Left-anchor: content span gets the bidi visual, trailing cells keep
+        // identity.
+        for (l2v, 0..) |*v, i| v.* = @intCast(i);
+        for (resolved.visual, 0..) |logical_idx, vis| l2v[logical_idx] = @intCast(vis);
+    }
+    @memcpy(lv[0..content_len], resolved.levels);
+
+    return .{ .logical_to_visual = l2v, .levels = lv };
+}
+
 const macos = switch (builtin.os.tag) {
     .macos => @import("macos"),
     else => void,
@@ -3038,45 +3113,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     for (cells_raw[0..content_len], 0..) |*c, i| {
                         cps[i] = cellCodepointForBidi(c);
                     }
-                    const resolved = if (auto)
-                        bidi_unicode.resolveRowAuto(self.alloc, cps) catch null
-                    else
-                        bidi_unicode.resolveRow(self.alloc, cps, .ltr) catch null;
-                    if (resolved) |r| {
-                        const l2v = try self.alloc.alloc(u16, cells_len);
-                        const lv = try self.alloc.alloc(u8, cells_len);
-                        @memset(lv, 0);
-                        if (r.base == .rtl) {
-                            // Right-anchor: shift the reordered content block to
-                            // the right edge; trailing logical blanks fill the
-                            // left. offset = free columns to the left.
-                            const offset: u16 = @intCast(cells_len - content_len);
-                            for (r.visual, 0..) |logical_idx, vis| {
-                                l2v[logical_idx] = offset + @as(u16, @intCast(vis));
-                            }
-                            // The trailing blanks continue the mirror, so they
-                            // run right-to-left away from the content block:
-                            // the first blank after the text sits immediately
-                            // to its LEFT, not at column 0. This is what puts
-                            // the cursor next to the text in an RTL row.
-                            var i: usize = content_len;
-                            while (i < cells_len) : (i += 1) {
-                                l2v[i] = @intCast(offset - 1 - (i - content_len));
-                            }
-                            // Levels track the content at its logical positions
-                            // (used only for shaping run splits, not position).
-                            @memcpy(lv[0..content_len], r.levels);
-                        } else {
-                            // Left-anchor: content span gets the bidi visual,
-                            // trailing cells keep identity.
-                            for (l2v, 0..) |*v, i| v.* = @intCast(i);
-                            for (r.visual, 0..) |logical_idx, vis| l2v[logical_idx] = @intCast(vis);
-                            @memcpy(lv[0..content_len], r.levels);
-                        }
-                        self.alloc.free(r.visual);
-                        self.alloc.free(r.levels);
-                        bidi_levels = lv; // freed by defer
-                        logical_to_visual = l2v; // freed by defer
+                    if (try bidiRowMap(self.alloc, cps, cells_len, auto)) |map| {
+                        bidi_levels = map.levels; // freed by defer
+                        logical_to_visual = map.logical_to_visual; // freed by defer
                     }
                 }
             }
@@ -3848,4 +3887,65 @@ test "prepared frame damage remains retryable until draw commit" {
         damage.commit();
     }
     try std.testing.expect(!cells_rebuilt);
+}
+
+test "bidiRowMap: RTL row right-anchors content and puts the cursor cell beside it" {
+    const alloc = std.testing.allocator;
+    // "שלום" (4 RTL letters) in a 10 column row.
+    const cps = [_]u21{ 0x05E9, 0x05DC, 0x05D5, 0x05DD };
+    const cells_len: usize = 10;
+
+    const map = (try bidiRowMap(alloc, &cps, cells_len, true)).?;
+    defer map.deinit(alloc);
+    const l2v = map.logical_to_visual;
+
+    // Content is right-anchored: the 4 letters occupy the last 4 columns.
+    const offset: u16 = @intCast(cells_len - cps.len); // 6
+    for (l2v[0..cps.len]) |v| try std.testing.expect(v >= offset);
+
+    // The cell the cursor occupies right after the last typed character is
+    // logical index 4, and it must land immediately LEFT of the content block
+    // (column 5), not at the far left edge (column 0). This is the regression:
+    // it used to map to 0, stranding the cursor across the screen.
+    try std.testing.expectEqual(@as(u16, offset - 1), l2v[cps.len]);
+
+    // Subsequent blanks continue leftwards.
+    try std.testing.expectEqual(@as(u16, offset - 2), l2v[cps.len + 1]);
+
+    // Every column is used exactly once - the map is a permutation.
+    var seen = [_]bool{false} ** 10;
+    for (l2v) |v| {
+        try std.testing.expect(v < cells_len);
+        try std.testing.expect(!seen[v]);
+        seen[v] = true;
+    }
+}
+
+test "bidiRowMap: LTR row leaves trailing cells at their own columns" {
+    const alloc = std.testing.allocator;
+    const cps = [_]u21{ 'a', 'b', 'c' };
+    const cells_len: usize = 8;
+
+    const map = (try bidiRowMap(alloc, &cps, cells_len, true)).?;
+    defer map.deinit(alloc);
+    const l2v = map.logical_to_visual;
+
+    // A Latin-first row stays left-anchored, so the cursor after "abc" sits at
+    // column 3 exactly where it logically is.
+    for (l2v, 0..) |v, i| try std.testing.expectEqual(@as(u16, @intCast(i)), v);
+}
+
+test "bidiRowMap: forced-LTR keeps a Hebrew row left-anchored" {
+    const alloc = std.testing.allocator;
+    const cps = [_]u21{ 0x05E9, 0x05DC, 0x05D5, 0x05DD };
+    const cells_len: usize = 10;
+
+    // auto=false forces the LTR base, i.e. the user's toggle is set to ltr.
+    const map = (try bidiRowMap(alloc, &cps, cells_len, false)).?;
+    defer map.deinit(alloc);
+    const l2v = map.logical_to_visual;
+
+    // The row must not be pushed to the right edge; the trailing cells keep
+    // identity so the cursor stays directly after the text.
+    try std.testing.expectEqual(@as(u16, @intCast(cps.len)), l2v[cps.len]);
 }
