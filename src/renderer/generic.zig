@@ -40,19 +40,6 @@ fn cellCodepointForBidi(cell: *const terminal.page.Cell) u21 {
     return if (cell.hasText()) cell.codepoint() else ' ';
 }
 
-/// Carries the cursor's logical position into row rebuilding so that the row
-/// owning the cursor can report where bidi reordering actually placed it.
-///
-/// The cursor is drawn after every row is built, but the logical->visual map
-/// is per-row and lives only for the duration of that row's rebuild. Rather
-/// than resolve the row's bidi order a second time just for the cursor, the
-/// row that matches `y` fills in `visual_x` on its way past.
-const BidiCursorRemap = struct {
-    y: terminal.size.CellCountInt,
-    logical_x: terminal.size.CellCountInt,
-    visual_x: ?terminal.size.CellCountInt = null,
-};
-
 /// A row's resolved bidi order: where each logical cell is drawn, plus the
 /// embedding levels used to split shaping runs.
 const BidiRowMap = struct {
@@ -2796,18 +2783,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
             } else null;
 
-            // Bidi reordering moves the cursor along with the text it sits in,
-            // so the row that owns it records its visual column below and the
-            // cursor is drawn there instead of at its logical column.
-            var cursor_remap: ?BidiCursorRemap = remap: {
-                if (!self.config.bidi) break :remap null;
-                const cursor_vp = state.cursor.viewport orelse break :remap null;
-                break :remap .{
-                    .y = @intCast(cursor_vp.y),
-                    .logical_x = @intCast(cursor_vp.x),
-                };
-            };
-
             for (
                 0..,
                 row_raws[0..row_len],
@@ -2837,7 +2812,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     selection,
                     highlights,
                     links,
-                    if (cursor_remap) |*r| r else null,
                 ) catch |err| {
                     // This should never happen except under exceptional
                     // scenarios. In this case, we don't want to corrupt
@@ -2916,8 +2890,47 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     break :cursor_color state.colors.foreground;
                 };
 
-                const cursor_visual_x: ?terminal.size.CellCountInt =
-                    if (cursor_remap) |r| r.visual_x else null;
+                // Bidi moves the cursor along with the text it sits in, so
+                // resolve the cursor row's order here rather than reusing the
+                // map built during rebuildRow: rows are only rebuilt when
+                // dirty, so on any frame that leaves the cursor's row alone
+                // (a blink, an edit elsewhere) that map is never produced and
+                // the cursor would snap back to its logical column.
+                const cursor_visual_x: ?terminal.size.CellCountInt = visual: {
+                    if (!self.config.bidi) break :visual null;
+                    if (cursor_vp.y >= row_len) break :visual null;
+
+                    const c_slice = row_cells[cursor_vp.y].slice();
+                    const c_len = @min(c_slice.len, self.cells.size.columns);
+                    if (c_len == 0) break :visual null;
+                    const c_raw = c_slice.items(.raw);
+
+                    var content_len: usize = 0;
+                    for (c_raw[0..c_len], 0..) |*c, i| {
+                        if (c.hasText()) content_len = i + 1;
+                    }
+                    if (content_len == 0) break :visual null;
+
+                    // We are past `errdefer comptime unreachable`, so failures
+                    // here degrade to the logical column instead of erroring.
+                    const cps = self.alloc.alloc(u21, content_len) catch
+                        break :visual null;
+                    defer self.alloc.free(cps);
+                    for (c_raw[0..content_len], 0..) |*c, i| {
+                        cps[i] = cellCodepointForBidi(c);
+                    }
+
+                    const map = (bidiRowMap(
+                        self.alloc,
+                        cps,
+                        c_len,
+                        self.config.bidi_direction == .rtl,
+                    ) catch break :visual null) orelse break :visual null;
+                    defer map.deinit(self.alloc);
+
+                    if (cursor_vp.x >= map.logical_to_visual.len) break :visual null;
+                    break :visual @intCast(map.logical_to_visual[cursor_vp.x]);
+                };
 
                 self.addCursor(
                     &state.cursor,
@@ -3030,7 +3043,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             selection: ?[2]terminal.size.CellCountInt,
             highlights: *const std.ArrayList(terminal.RenderState.Highlight),
             links: *const terminal.RenderState.CellSet,
-            cursor_remap: ?*BidiCursorRemap,
         ) !void {
             const state = &self.terminal_state;
 
@@ -3120,19 +3132,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
             run_iter_opts.bidi_levels = bidi_levels;
-
-            // Report where this row's reordering put the cursor, if it is here.
-            // Without this the cursor is drawn at its logical column, which in
-            // an RTL row is nowhere near the text it is supposed to follow.
-            if (cursor_remap) |remap| {
-                if (remap.y == y) {
-                    if (logical_to_visual) |l2v| {
-                        if (remap.logical_x < l2v.len) {
-                            remap.visual_x = @intCast(l2v[remap.logical_x]);
-                        }
-                    }
-                }
-            }
 
             var run_iter = self.font_shaper.runIterator(run_iter_opts);
             var shaper_run: ?font.shape.TextRun = try run_iter.next(self.alloc);
@@ -3948,4 +3947,40 @@ test "bidiRowMap: forced-LTR keeps a Hebrew row left-anchored" {
     // The row must not be pushed to the right edge; the trailing cells keep
     // identity so the cursor stays directly after the text.
     try std.testing.expectEqual(@as(u16, @intCast(cps.len)), l2v[cps.len]);
+}
+
+test "bidiRowMap: cursor sits beside the text in a bordered TUI row" {
+    const alloc = std.testing.allocator;
+    // Models the bordered input box Claude Code draws: a border glyph at both
+    // edges means the row's content spans its full width, so the right-anchor
+    // offset is zero and the cursor is placed purely by the content's bidi
+    // order rather than by the trailing-blank rule.
+    const W: usize = 24;
+    var cps: [W]u21 = undefined;
+    for (&cps) |*c| c.* = ' ';
+    cps[0] = 0x2502; // left border
+    cps[2] = 0x276F; // prompt
+    cps[4] = 0x05D4; // he
+    cps[5] = 0x05D9; // yod
+    cps[6] = 0x05D9; // yod
+    cps[W - 1] = 0x2502; // right border
+    const cursor_logical: usize = 7; // right after the last typed letter
+
+    const map = (try bidiRowMap(alloc, &cps, W, true)).?;
+    defer map.deinit(alloc);
+    const l2v = map.logical_to_visual;
+
+    // The Hebrew reverses into a contiguous block.
+    const h0 = l2v[4];
+    const h1 = l2v[5];
+    const h2 = l2v[6];
+    try std.testing.expectEqual(h0, h1 + 1);
+    try std.testing.expectEqual(h1, h2 + 1);
+
+    // The cursor belongs immediately to the LEFT of that block, because in an
+    // RTL row the insertion point advances leftwards. Landing anywhere else -
+    // in particular back at its logical column 7 - is the reported bug.
+    const leftmost_hebrew = @min(h0, @min(h1, h2));
+    try std.testing.expectEqual(leftmost_hebrew - 1, l2v[cursor_logical]);
+    try std.testing.expect(l2v[cursor_logical] != cursor_logical);
 }
