@@ -3984,3 +3984,47 @@ test "bidiRowMap: cursor sits beside the text in a bordered TUI row" {
     try std.testing.expectEqual(leftmost_hebrew - 1, l2v[cursor_logical]);
     try std.testing.expect(l2v[cursor_logical] != cursor_logical);
 }
+
+test "bidiRowMap: a hyphenated Latin word in an RTL row stays contiguous" {
+    const alloc = std.testing.allocator;
+    // "אבג max-height" typed on a Hebrew row. The hyphen used to drop to
+    // embedding level 0, which cut the paragraph run in two and scattered the
+    // word across the row as "max <hebrew> -height".
+    const cps = [_]u21{
+        0x05D0, 0x05D1, 0x05D2, ' ',
+        'm',    'a',    'x',    '-',
+        'h',    'e',    'i',    'g',
+        'h',    't',
+    };
+    const cells_len: usize = 40;
+
+    const map = (try bidiRowMap(alloc, &cps, cells_len, true)).?;
+    defer map.deinit(alloc);
+    const l2v = map.logical_to_visual;
+
+    // The whole Latin span (indices 4..13, hyphen included) is drawn in
+    // logical order in consecutive columns.
+    var i: usize = 5;
+    while (i <= 13) : (i += 1) {
+        try std.testing.expectEqual(l2v[i - 1] + 1, l2v[i]);
+    }
+
+    // ...and it sits to the LEFT of the Hebrew, which reads right-to-left.
+    try std.testing.expect(l2v[13] < l2v[2]);
+    try std.testing.expectEqual(l2v[0], l2v[1] + 1);
+    try std.testing.expectEqual(l2v[1], l2v[2] + 1);
+}
+
+test "bidiRowMap: a decimal number in an RTL row keeps its digit order" {
+    const alloc = std.testing.allocator;
+    // "אבג 1.5" used to render the number as "5.1".
+    const cps = [_]u21{ 0x05D0, 0x05D1, 0x05D2, ' ', '1', '.', '5' };
+    const cells_len: usize = 20;
+
+    const map = (try bidiRowMap(alloc, &cps, cells_len, true)).?;
+    defer map.deinit(alloc);
+    const l2v = map.logical_to_visual;
+
+    try std.testing.expectEqual(l2v[4] + 1, l2v[5]);
+    try std.testing.expectEqual(l2v[5] + 1, l2v[6]);
+}
