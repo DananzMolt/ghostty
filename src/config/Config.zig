@@ -938,12 +938,17 @@ palette: Palette = .{},
 /// terminal moves the cursor to the start of the selection with arrow keys,
 /// deletes the selected positions, and then lets your keystroke through.
 ///
-/// Consequently this carries the same requirements and caveats as
-/// `cursor-click-to-move`, which it builds on. It needs `OSC 133` shell
-/// integration with the `cl` click option, it only applies to a selection
-/// that lies entirely inside the current prompt's input, and it does nothing
-/// while an application has taken over the screen (those own their own
-/// editing). Selections in command output remain copy-only.
+/// This needs `OSC 133` shell integration, specifically the `B` mark that
+/// says where input begins, so the terminal can tell your command line apart
+/// from the prompt around it. It does NOT need the `cl` or `click_events`
+/// click option that `cursor-click-to-move` uses: the cursor is placed with
+/// arrow keys, which every line editor understands, rather than by asking the
+/// shell to resolve a click.
+///
+/// It only applies to a selection lying entirely inside the current prompt's
+/// input, and does nothing while an application has taken over the screen
+/// (those own their own editing). Selections in command output stay
+/// copy-only.
 ///
 /// Disabled on right-to-left rows, where a visually contiguous selection does
 /// not map to a contiguous run of input positions.

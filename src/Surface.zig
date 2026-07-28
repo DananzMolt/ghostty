@@ -5083,23 +5083,22 @@ fn maybePromptSelectionEdit(self: *Surface, event: input.KeyEvent) !PromptSelect
     const t: *terminal.Terminal = self.renderer_state.terminal;
     const screen: *terminal.Screen = t.screens.active;
 
-    // We drive this with synthetic arrow keys, so we need the shell to have
-    // advertised the `cl` click option. `click_events` shells resolve clicks
-    // themselves and have no equivalent for a ranged delete.
-    switch (screen.semantic_prompt.click) {
-        .cl => {},
-        .none, .click_events => return .none,
-    }
+    // Note what is deliberately NOT required here: the `cl` / `click_events`
+    // click option. We place the cursor with arrow keys rather than asking
+    // the shell to resolve a click, so all this needs is OSC 133 `B` input
+    // marking. That makes it work on shells that mark input but advertise no
+    // click support, and on shells that advertise click support they do not
+    // honor (fish 4 advertises `click_events=1`, then ignores the injected
+    // event while responding to arrow keys normally).
 
     // Only at a prompt. Inside a full-screen application the selection is
     // ours alone and the application owns its own editing.
     if (!t.cursorIsAtPrompt()) return .none;
 
-    // The cursor must be sitting on input. This is the same condition
-    // `promptClickMove` requires, and it matters here for a reason it does
-    // not there: that function reports "no movement" when it fails, which is
-    // indistinguishable from "already in the right place". Deleting on that
-    // answer would delete from wherever the cursor happens to be.
+    // The cursor must be sitting on input, because the arrow count is
+    // measured from it. `promptLineMove` reports no movement both when it
+    // succeeds trivially and when it cannot move at all, and deleting on the
+    // second would delete from wherever the cursor happens to be.
     if (screen.cursor.semantic_content != .input and
         screen.cursor.page_cell.semantic_content != .input) return .none;
 
@@ -5137,7 +5136,7 @@ fn maybePromptSelectionEdit(self: *Surface, event: input.KeyEvent) !PromptSelect
     // should be driving one keystroke at a time.
     if (count > max_prompt_selection_edit) return .none;
 
-    const move = screen.promptClickMove(tl);
+    const move = screen.promptLineMove(tl);
 
     const left_arrow = if (t.modes.get(.cursor_keys)) "\x1bOD" else "\x1b[D";
     const right_arrow = if (t.modes.get(.cursor_keys)) "\x1bOC" else "\x1b[C";

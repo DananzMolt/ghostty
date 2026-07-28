@@ -3397,6 +3397,27 @@ fn promptClickLine(self: *Screen, click_pin: Pin) PromptClickMove {
     return .{ .left = count, .right = 0 };
 }
 
+/// Like `promptClickMove`, but always computes line-based arrow motion no
+/// matter what the shell advertised for click handling.
+///
+/// `promptClickMove` hands `click_events` shells back zero movement on
+/// purpose: for a click it is better to let the shell resolve the position
+/// itself. That is the wrong answer for a caller that needs to know where the
+/// cursor ended up, such as a ranged delete, and a shell can advertise click
+/// handling that it does not actually apply (fish 4 advertises
+/// `click_events=1` but ignores the event when it is injected, while
+/// responding to arrow keys normally).
+///
+/// Arrow keys are understood by every line editor, so this is the portable
+/// way to place the cursor when the terminal must stay in control.
+///
+/// The caller must have already established that the cursor is on an input
+/// cell; as with `promptClickMove`, zero movement here is ambiguous between
+/// "already there" and "cannot move".
+pub fn promptLineMove(self: *Screen, target: Pin) PromptClickMove {
+    return self.promptClickLine(target);
+}
+
 /// Count the editable positions covered by the inclusive cell range
 /// [start, end].
 ///
@@ -11199,4 +11220,54 @@ test "Screen: promptClickMove does not give a wide character two arrows" {
     const result = s.promptClickMove(click_pin);
     try testing.expectEqual(@as(usize, 2), result.right);
     try testing.expectEqual(@as(usize, 0), result.left);
+}
+
+test "Screen: promptLineMove works when the shell advertised click_events" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    // fish 4 advertises this, and promptClickMove deliberately returns zero
+    // for it so the shell can resolve clicks itself. Selection editing has to
+    // drive the cursor regardless, so promptLineMove must still answer.
+    s.semantic_prompt.click = .{ .click_events = .absolute };
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("hello");
+
+    s.cursorAbsolute(2, 0);
+    const target = s.pages.pin(.{ .active = .{ .x = 4, .y = 0 } }).?;
+
+    try testing.expectEqual(PromptClickMove.zero, s.promptClickMove(target));
+
+    const move = s.promptLineMove(target);
+    try testing.expectEqual(@as(usize, 2), move.right);
+    try testing.expectEqual(@as(usize, 0), move.left);
+}
+
+test "Screen: promptLineMove counts leftward too" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.semantic_prompt.click = .{ .click_events = .absolute };
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("hello");
+
+    // Cursor past the end, target the 'e'.
+    s.cursorAbsolute(6, 0);
+    const target = s.pages.pin(.{ .active = .{ .x = 3, .y = 0 } }).?;
+
+    const move = s.promptLineMove(target);
+    try testing.expectEqual(@as(usize, 0), move.right);
+    try testing.expectEqual(@as(usize, 3), move.left);
 }
