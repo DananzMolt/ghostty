@@ -3495,28 +3495,6 @@ pub fn promptInputStepWord(
     }
 }
 
-/// Skip backwards over any run of spaces, returning the first non-space
-/// position at or before `from`, or `from` itself if it is not a space.
-///
-/// Used to place a selection anchor: the caret often sits just past a word,
-/// and a selection growing away from it should start at the word rather than
-/// swallow the whitespace in between.
-pub fn promptInputSkipSpaces(
-    self: *const Screen,
-    from: Pin,
-    dir: PromptStep,
-) Pin {
-    var cur = from;
-    while (true) {
-        const cell = cur.rowAndCell().cell;
-        const is_space = !cell.hasText() or
-            cell.codepoint() == ' ' or
-            cell.codepoint() == '\t';
-        if (!is_space) return cur;
-        cur = self.promptInputStep(cur, dir) orelse return cur;
-    }
-}
-
 /// Count the editable positions covered by the inclusive cell range
 /// [start, end].
 ///
@@ -11395,26 +11373,4 @@ test "Screen: promptInputStepWord stops on the word, not the separator" {
     const from2 = s.pages.pin(.{ .active = .{ .x = 3, .y = 0 } }).?;
     const fwd = s.promptInputStepWord(from2, .forward).?;
     try testing.expectEqual(@as(usize, 7), fwd.x);
-}
-
-test "Screen: promptInputSkipSpaces walks off the whitespace" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    var s = try init(alloc, .{ .cols = 40, .rows = 5, .max_scrollback = 0 });
-    defer s.deinit();
-
-    s.cursorSetSemanticContent(.{ .prompt = .initial });
-    try s.testWriteString("> ");
-    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
-    try s.testWriteString("da asd");
-
-    // Sitting on the space at column 4, skipping backward reaches the 'a'
-    // that ends "da" at column 3.
-    const space = s.pages.pin(.{ .active = .{ .x = 4, .y = 0 } }).?;
-    try testing.expectEqual(@as(usize, 3), s.promptInputSkipSpaces(space, .backward).x);
-
-    // A non-space is already where it needs to be.
-    const letter = s.pages.pin(.{ .active = .{ .x = 5, .y = 0 } }).?;
-    try testing.expectEqual(@as(usize, 5), s.promptInputSkipSpaces(letter, .backward).x);
 }

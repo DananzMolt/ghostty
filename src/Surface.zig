@@ -5129,13 +5129,11 @@ fn maybePromptSelectionMove(self: *Surface, event: input.KeyEvent) !bool {
                 return true,
         };
 
-        // For a word selection, park the anchor on the word rather than on
-        // the whitespace between it and the caret, so the run of spaces the
-        // caret was sitting past is not dragged in.
-        break :anchor if (move.word)
-            .{ screen.promptInputSkipSpaces(first, move.dir), first }
-        else
-            .{ first, first };
+        // The anchor is that cell, whatever it holds. A caret parked just
+        // after a space anchors ON the space, so selecting the word before it
+        // takes the separator too, which is what reads correctly when you are
+        // about to type over the result.
+        break :anchor .{ first, first };
     };
 
     // A fresh non-word selection is just the anchor cell itself.
