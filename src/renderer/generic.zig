@@ -3211,6 +3211,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
 
                 const wide = cell.wide;
+
+                // Visual column this cell is drawn at. Bidi reordering makes
+                // this differ from the logical index `x`, which stays the key
+                // for looking up cell CONTENT (codepoint, style, links).
+                // Everything painted into the grid has to use this instead,
+                // or a right-to-left row draws its glyphs in one place and its
+                // background, selection highlight and decorations in another.
+                const draw_x: u16 = if (logical_to_visual) |l2v|
+                    l2v[x]
+                else
+                    @intCast(x);
                 const style: terminal.Style = if (cell.hasStyling())
                     managed_style.*
                 else
@@ -3378,7 +3389,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         break :bg_alpha 0;
                     };
 
-                    self.cells.bgCell(y, x).* = .{
+                    self.cells.bgCell(y, draw_x).* = .{
                         rgb.r, rgb.g, rgb.b, bg_alpha,
                     };
                 }
@@ -3415,7 +3426,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // This improves readability when a colored underline is used
                 // which intersects parts of the text (descenders).
                 if (underline != .none) self.addUnderline(
-                    @intCast(x),
+                    draw_x,
                     @intCast(y),
                     underline,
                     style.underlineColor(&state.colors.palette) orelse fg,
@@ -3427,7 +3438,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     );
                 };
 
-                if (style.flags.overline) self.addOverline(@intCast(x), @intCast(y), fg, alpha) catch |err| {
+                if (style.flags.overline) self.addOverline(draw_x, @intCast(y), fg, alpha) catch |err| {
                     log.warn(
                         "error adding overline to cell, will be invalid x={} y={}, err={}",
                         .{ x, y, err },
@@ -3492,7 +3503,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         run.offset + shaped_cells[shaper_cells_i].x == x) : ({
                         shaper_cells_i += 1;
                     }) {
-                        const draw_x: u16 = if (logical_to_visual) |l2v| l2v[x] else @intCast(x);
                         self.addGlyph(
                             draw_x,
                             @intCast(x),
@@ -3514,7 +3524,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Finally, draw a strikethrough if necessary.
                 if (style.flags.strikethrough) self.addStrikethrough(
-                    @intCast(x),
+                    draw_x,
                     @intCast(y),
                     fg,
                     alpha,
