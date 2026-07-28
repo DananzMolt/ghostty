@@ -29,6 +29,9 @@ pub const StyleOptions = struct {
     preedit: bool = false,
     focused: bool = false,
     blink_visible: bool = false,
+
+    /// Hide the cursor while a selection is active. See the note in `style`.
+    hide_while_selecting: bool = false,
 };
 
 /// Returns the cursor style to use for the current render state or null
@@ -51,6 +54,15 @@ pub fn style(
 
     // If we're at a password input its always a lock.
     if (state.cursor.password_input) return .lock;
+
+    // While there is a selection, the selection is the editing intent: the
+    // next keystroke acts on it rather than at the cursor. Drawing both
+    // invites the reader to believe typing will land at the cursor, and the
+    // block cursor sitting inside the highlight is just visual noise.
+    //
+    // Ranked below preedit and password input, which are states the user
+    // needs to see even mid-selection.
+    if (opts.hide_while_selecting and state.selection_active) return null;
 
     // If the cursor is explicitly not visible by terminal mode, we don't render.
     if (!state.cursor.visible) return null;
@@ -151,4 +163,66 @@ test "cursor: always block with preedit" {
     try testing.expect(style(&state, .{ .preedit = true, .focused = true, .blink_visible = false }) == null);
     try testing.expect(style(&state, .{ .preedit = true, .focused = true, .blink_visible = true }) == null);
     try testing.expect(style(&state, .{ .preedit = true, .focused = false, .blink_visible = true }) == null);
+}
+
+test "cursor: hidden while a selection is active" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var term: terminal.Terminal = try .init(alloc, .{ .cols = 10, .rows = 10 });
+    defer term.deinit(alloc);
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+
+    // Baseline: visible with no selection.
+    try testing.expect(style(&state, .{
+        .focused = true,
+        .blink_visible = true,
+        .hide_while_selecting = true,
+    }) != null);
+
+    state.selection_active = true;
+
+    // Hidden once something is selected...
+    try testing.expect(style(&state, .{
+        .focused = true,
+        .blink_visible = true,
+        .hide_while_selecting = true,
+    }) == null);
+
+    // ...but only when the option is on.
+    try testing.expect(style(&state, .{
+        .focused = true,
+        .blink_visible = true,
+        .hide_while_selecting = false,
+    }) != null);
+}
+
+test "cursor: preedit and password outrank a selection" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var term: terminal.Terminal = try .init(alloc, .{ .cols = 10, .rows = 10 });
+    defer term.deinit(alloc);
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+    state.selection_active = true;
+
+    // Composing text still needs its cursor.
+    try testing.expectEqual(Style.block, style(&state, .{
+        .preedit = true,
+        .focused = true,
+        .blink_visible = true,
+        .hide_while_selecting = true,
+    }).?);
+
+    // So does a password prompt, which uses the cursor as its indicator.
+    state.cursor.password_input = true;
+    try testing.expectEqual(Style.lock, style(&state, .{
+        .focused = true,
+        .blink_visible = true,
+        .hide_while_selecting = true,
+    }).?);
 }

@@ -88,6 +88,11 @@ pub const RenderState = struct {
     /// Cursor state within the viewport.
     cursor: Cursor,
 
+    /// True when the screen has an active selection, anywhere, including
+    /// entirely outside the viewport. Distinct from the per-row `selection`
+    /// ranges, which only describe what is currently visible.
+    selection_active: bool = false,
+
     /// The rows (y=0 is top) of the viewport. Guaranteed to be `rows` length.
     ///
     /// This is a MultiArrayList because only the update cares about
@@ -623,6 +628,8 @@ pub const RenderState = struct {
         // There are performance improvements that can be made here, though.
         // For example, `containedRow` recalculates a bunch of information
         // we can cache.
+        self.selection_active = s.selection != null;
+
         if (s.selection) |*sel| selection: {
             @branchHint(.unlikely);
 

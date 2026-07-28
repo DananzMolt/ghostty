@@ -930,6 +930,18 @@ palette: Palette = .{},
 /// behavior around edge cases is possible.
 @"cursor-click-to-move": bool = true,
 
+/// Hide the cursor while text is selected, the way a text editor hides its
+/// caret during a selection.
+///
+/// With `selection-edit-at-prompt` on, the selection is what the next
+/// keystroke acts on, so a cursor drawn inside the highlight is actively
+/// misleading about where typing will land.
+///
+/// The cursor returns as soon as the selection is cleared. Preedit and
+/// password-input states still show their cursor, since those are things you
+/// need to see even mid-selection.
+@"cursor-hide-while-selecting": bool = true,
+
 /// Lets a selection made at a prompt behave like a selection in a text
 /// editor: typing replaces it, and backspace or delete removes it.
 ///
