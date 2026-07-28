@@ -34,6 +34,7 @@ const configpkg = @import("config.zig");
 const Duration = configpkg.Config.Duration;
 const input = @import("input.zig");
 const bidi_unicode = @import("bidi_unicode.zig");
+const bidi_row = @import("bidi_row.zig");
 const App = @import("App.zig");
 const internal_os = @import("os/main.zig");
 const inspectorpkg = @import("inspector/main.zig");
@@ -118,17 +119,6 @@ keyboard: Keyboard,
 /// this. Plus, its only for release events where the key text is far
 /// less important.
 pressed_key: ?input.KeyEvent = null,
-
-/// The last selection this surface built from Shift+arrow, if it is still the
-/// live one.
-///
-/// Selection editing is otherwise refused on right-to-left rows, because a
-/// mouse selection there is derived from visual columns and does not name the
-/// logical run the user dragged over. A keyboard selection has no such
-/// problem: it is walked one logical position at a time. Remembering the
-/// exact Selection lets the edit path tell the two apart, and any mouse
-/// activity replaces the selection so the values stop matching on their own.
-prompt_keyboard_selection: ?terminal.Selection = null,
 
 /// The hash value of the last keybinding trigger that we performed. This
 /// is only set if the last key input matched a keybinding, consumed it,
@@ -426,6 +416,8 @@ const DerivedConfig = struct {
     /// True when the display is mirrored, so the horizontal arrow keys are
     /// swapped to follow the text as drawn. See key_encode.Options.
     bidi_swap_arrows: bool,
+    bidi: bool,
+    bidi_rtl: bool,
     selection_clear_on_copy: bool,
     selection_clear_on_typing: bool,
     selection_word_chars: []const u21,
@@ -513,6 +505,8 @@ const DerivedConfig = struct {
             .macos_non_native_fullscreen = config.@"macos-non-native-fullscreen",
             .macos_option_as_alt = config.@"macos-option-as-alt",
             .bidi_swap_arrows = config.bidi and config.@"bidi-direction" == .rtl,
+            .bidi = config.bidi,
+            .bidi_rtl = config.@"bidi-direction" == .rtl,
             .selection_clear_on_copy = config.@"selection-clear-on-copy",
             .selection_clear_on_typing = config.@"selection-clear-on-typing",
             .selection_word_chars = try alloc.dupe(u21, config.@"selection-word-chars".codepoints),
@@ -1836,7 +1830,9 @@ fn mouseRefreshLinks(
         }
 
         const screen = self.renderer_state.terminal.screens.active;
-        const mouse_pin = screen.pages.pin(.{ .viewport = pos_vp }) orelse
+        const mouse_pin = screen.pages.pin(.{
+            .viewport = self.logicalViewportPoint(pos_vp),
+        }) orelse
             break :link .{ null, false };
         const effective_mods = if (self.mouse.link_click_active)
             input.ctrlOrSuper(.{})
@@ -1881,7 +1877,9 @@ fn mouseRefreshLinks(
                 self.mouse.link_point = null;
                 break :link .{ null, false };
             }
-            const current_pin = screen.pages.pin(.{ .viewport = pos_vp }) orelse {
+            const current_pin = screen.pages.pin(.{
+                .viewport = self.logicalViewportPoint(pos_vp),
+            }) orelse {
                 self.mouse.link_point = null;
                 break :link .{ null, false };
             };
@@ -3890,6 +3888,57 @@ fn encodeKey(
     return write_req;
 }
 
+/// Map a viewport coordinate whose `x` is a SCREEN column to the logical cell
+/// sitting there, undoing the row's bidi reordering.
+///
+/// Everything downstream of the mouse works in logical cells: pins, links,
+/// selections. `posToViewport` produces a screen column, and on a row that
+/// bidi reordered, the two are different cells. Feeding the screen column
+/// straight in is why dragging across Hebrew selected the wrong text.
+///
+/// Rows that did not reorder, which is every Latin row, come back unchanged.
+///
+/// Caller must already hold the renderer mutex.
+fn logicalViewportPoint(
+    self: *Surface,
+    vp: terminal.point.Coordinate,
+) terminal.point.Coordinate {
+    if (!self.config.bidi) return vp;
+
+    const screen = self.io.terminal.screens.active;
+    const row_pin = screen.pages.pin(.{ .viewport = .{
+        .x = 0,
+        .y = vp.y,
+    } }) orelse return vp;
+
+    const cells = row_pin.cells(.all);
+    if (cells.len == 0) return vp;
+
+    // Content runs to the last cell with text, matching the renderer.
+    var content_len: usize = 0;
+    for (cells, 0..) |*c, i| {
+        if (c.hasText()) content_len = i + 1;
+    }
+    if (content_len == 0) return vp;
+
+    const cps = self.alloc.alloc(u21, content_len) catch return vp;
+    defer self.alloc.free(cps);
+    for (cells[0..content_len], 0..) |*c, i| {
+        cps[i] = bidi_row.cellCodepointForBidi(c);
+    }
+
+    const map = (bidi_row.bidiRowMap(
+        self.alloc,
+        cps,
+        cells.len,
+        self.config.bidi_rtl,
+    ) catch return vp) orelse return vp;
+    defer map.deinit(self.alloc);
+
+    const logical = map.visualToLogical(vp.x) orelse return vp;
+    return .{ .x = logical, .y = vp.y };
+}
+
 /// Whether the row the cursor sits on is drawn right-to-left.
 ///
 /// The arrows mirror only on rows that are actually mirrored. A blanket swap
@@ -4569,7 +4618,9 @@ pub fn mouseButtonCallback(
         // gesture can conservatively treat the release as having moved away
         // from the pressed cell.
         const release_pin: ?terminal.Pin = if (release_pos) |pos| pin: {
-            const release_vp = self.posToViewport(pos.x, pos.y);
+            const release_vp = self.logicalViewportPoint(
+                self.posToViewport(pos.x, pos.y),
+            );
             break :pin self.io.terminal.screens.active.pages.pin(.{ .viewport = .{
                 .x = release_vp.x,
                 .y = release_vp.y,
@@ -4708,7 +4759,9 @@ pub fn mouseButtonCallback(
 
         const pos = try self.rt_surface.getCursorPos();
         const pin = pin: {
-            const pt_viewport = self.posToViewport(pos.x, pos.y);
+            const pt_viewport = self.logicalViewportPoint(
+                self.posToViewport(pos.x, pos.y),
+            );
             const pin = screen.pages.pin(.{
                 .viewport = .{
                     .x = pt_viewport.x,
@@ -4820,7 +4873,9 @@ pub fn mouseButtonCallback(
         const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
         const pos = try self.rt_surface.getCursorPos();
         const pin = pin: {
-            const pt_viewport = self.posToViewport(pos.x, pos.y);
+            const pt_viewport = self.logicalViewportPoint(
+                self.posToViewport(pos.x, pos.y),
+            );
             const pin = screen.pages.pin(.{
                 .viewport = .{
                     .x = pt_viewport.x,
@@ -5139,7 +5194,6 @@ fn maybePromptSelectionMove(self: *Surface, event: input.KeyEvent) !bool {
     // A fresh non-word selection is just the anchor cell itself.
     if (screen.selection == null and !move.word) {
         try self.setSelection(.init(anchor, anchor, false));
-        self.prompt_keyboard_selection = screen.selection;
         return true;
     }
 
@@ -5159,12 +5213,10 @@ fn maybePromptSelectionMove(self: *Surface, event: input.KeyEvent) !bool {
     // Stepping back onto the anchor means the selection is empty again.
     if (new_head.eql(anchor) and screen.selection != null) {
         try self.setSelection(null);
-        self.prompt_keyboard_selection = null;
         return true;
     }
 
     try self.setSelection(.init(anchor, new_head, false));
-    self.prompt_keyboard_selection = screen.selection;
     return true;
 }
 
@@ -5258,18 +5310,11 @@ fn maybePromptSelectionEdit(self: *Surface, event: input.KeyEvent) !PromptSelect
     // A rectangle selection is not a run of input positions.
     if (sel.rectangle) return .none;
 
-    // On a right-to-left row a MOUSE selection is contiguous on screen but its
-    // logical positions are not, so a ranged delete would remove the wrong
-    // text. Those stay copy-only until the mouse path maps visual columns back
-    // to logical cells.
-    //
-    // A Shift+arrow selection is exempt: it was walked one logical position at
-    // a time, so its endpoints mean exactly what they say. Any mouse activity
-    // replaces the selection and this stops matching.
-    if (self.cursorRowIsRtl()) {
-        const kb = self.prompt_keyboard_selection orelse return .none;
-        if (!kb.eql(sel)) return .none;
-    }
+    // Right-to-left rows used to be refused here, because the mouse turned a
+    // screen column straight into a logical cell and so did not name the run
+    // the user dragged over. `logicalViewportPoint` now inverts the row's bidi
+    // order on the way in, so both mouse and keyboard selections carry
+    // endpoints that mean what they say.
 
     const tl = sel.topLeft(screen);
     const br = sel.bottomRight(screen);
@@ -5321,7 +5366,6 @@ fn maybePromptSelectionEdit(self: *Surface, event: input.KeyEvent) !PromptSelect
     // The text it referred to is gone, so the selection has to go with it
     // regardless of `selection-clear-on-typing`.
     try self.setSelection(null);
-    self.prompt_keyboard_selection = null;
 
     return intent;
 }
@@ -5494,7 +5538,7 @@ fn linkAtPos(
     // Convert our cursor position to a screen point.
     const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
     const mouse_pin: terminal.Pin = mouse_pin: {
-        const point = self.posToViewport(pos.x, pos.y);
+        const point = self.logicalViewportPoint(self.posToViewport(pos.x, pos.y));
         const pin = screen.pages.pin(.{ .viewport = point }) orelse {
             log.warn("failed to get pin for clicked point", .{});
             return null;
