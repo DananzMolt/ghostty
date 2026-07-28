@@ -114,9 +114,13 @@ fn strongDir(c: Class) ?Direction {
 /// A maximal run of neutral characters takes the direction of the surrounding
 /// strong context if both sides agree (sequence boundaries count as the base
 /// direction); otherwise it takes the base direction. `levels` is updated for
-/// each resolved neutral: ltr -> even base level, rtl -> base_level | 1.
+/// each resolved neutral using the SAME level assignment strong characters get
+/// in `resolveLevels`: ltr -> smallest even level >= base_level, rtl ->
+/// smallest odd level >= base_level.
 fn resolveNeutrals(classes: []const Class, base: Direction, levels: []u8) void {
     const base_level: u8 = if (base == .rtl) 1 else 0;
+    const even_at_or_above: u8 = if (base_level % 2 == 0) base_level else base_level + 1;
+    const odd_at_or_above: u8 = if (base_level % 2 == 1) base_level else base_level + 1;
     var i: usize = 0;
     while (i < classes.len) {
         if (!isNeutral(classes[i])) {
@@ -139,7 +143,12 @@ fn resolveNeutrals(classes: []const Class, base: Direction, levels: []u8) void {
         }
 
         const resolved: Direction = if (before == after) before else base;
-        const lvl: u8 = if (resolved == .rtl) (base_level | 1) else (base_level & ~@as(u8, 1));
+        // An LTR-resolved neutral inside an RTL paragraph belongs to the
+        // embedded LTR run at level 2, NOT level 0. Dropping it to 0 split the
+        // level-1 paragraph run in two, so L2 reordered the text on either
+        // side of the neutral independently ("max-height" rendered as
+        // "max <hebrew> -height").
+        const lvl: u8 = if (resolved == .rtl) odd_at_or_above else even_at_or_above;
         var k = i;
         while (k < j) : (k += 1) levels[k] = lvl;
         i = j;
@@ -189,6 +198,29 @@ test "resolveLevels: neutral between RTL {R,WS,R} base rtl -> {1,1,1}" {
     var levels: [3]u8 = undefined;
     resolveLevels(&.{ .right_to_left, .whitespace, .right_to_left }, .rtl, &levels);
     try testing.expectEqualSlices(u8, &.{ 1, 1, 1 }, &levels);
+}
+
+test "resolveLevels: neutral inside an LTR word, rtl base -> level 2 not 0" {
+    // "max-height" in a Hebrew line: the hyphen (ES) sits between two L runs,
+    // so N1 resolves it LTR. It must join the embedded LTR run at level 2 —
+    // level 0 would break the level-1 paragraph run in half.
+    var levels: [3]u8 = undefined;
+    resolveLevels(
+        &.{ .left_to_right, .european_number_separator, .left_to_right },
+        .rtl,
+        &levels,
+    );
+    try testing.expectEqualSlices(u8, &.{ 2, 2, 2 }, &levels);
+}
+
+test "resolveLevels: space between two LTR words, rtl base -> level 2" {
+    var levels: [3]u8 = undefined;
+    resolveLevels(
+        &.{ .left_to_right, .whitespace, .left_to_right },
+        .rtl,
+        &levels,
+    );
+    try testing.expectEqualSlices(u8, &.{ 2, 2, 2 }, &levels);
 }
 
 /// UAX #9 L2: produce the logical-index-by-visual-position map.
@@ -303,4 +335,30 @@ test "resolveClasses: mixed LTR run, RTL base -> level 2 run, right-to-left orde
     // `visual` is visual->logical (visual[pos] = logical drawn there). RTL base
     // puts the R cell (logical 2) at the left, then the LTR pair in order.
     try testing.expectEqualSlices(u16, &.{ 2, 0, 1 }, res.visual);
+}
+
+test "resolveClasses: hyphenated LTR word in an RTL row stays contiguous" {
+    // Regression: typing "max-height" on a Hebrew (RTL base) row rendered as
+    // "max <hebrew> -height" because the hyphen was assigned level 0, cutting
+    // the level-1 run so L2 reordered each half on its own.
+    //   logical: R R WS m a x - h t
+    const classes = [_]Class{
+        .right_to_left,
+        .right_to_left,
+        .whitespace,
+        .left_to_right,
+        .left_to_right,
+        .left_to_right,
+        .european_number_separator,
+        .left_to_right,
+        .left_to_right,
+    };
+    const res = try resolveClasses(testing.allocator, &classes, .rtl);
+    defer testing.allocator.free(res.levels);
+    defer testing.allocator.free(res.visual);
+
+    try testing.expectEqualSlices(u8, &.{ 1, 1, 1, 2, 2, 2, 2, 2, 2 }, res.levels);
+    // The whole Latin span (including the hyphen) is drawn left-to-right at
+    // the left of the row, then the space, then the Hebrew read right-to-left.
+    try testing.expectEqualSlices(u16, &.{ 3, 4, 5, 6, 7, 8, 2, 1, 0 }, res.visual);
 }
