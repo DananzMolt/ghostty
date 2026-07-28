@@ -5097,42 +5097,27 @@ const PromptSelectionMove = struct {
     word: bool,
 };
 
-/// Classify a key press as a keyboard-selection request, or null.
+/// Map a SCREEN arrow direction to a logical direction through the command
+/// line.
 ///
-/// `rtl` is whether the cursor's row reads right-to-left. The arrow keys name
-/// a direction on SCREEN, while the selection moves through the command line
-/// in LOGICAL order, and on a right-to-left row those are opposites: the next
-/// character of a Hebrew command line is drawn further LEFT. So Shift+Left
-/// extends forward there, and Shift+Right extends back.
+/// The arrows name a direction on screen, while the selection walks the
+/// command line in logical order, and on a right-to-left row those are
+/// opposites: the next character of a Hebrew command line is drawn further
+/// LEFT. So Shift+Left extends forward there, and Shift+Right extends back.
 ///
 /// This is the same rule the fork already applies to plain arrow keys via
 /// `bidi_swap_arrows`, kept in agreement deliberately: selecting with Shift
 /// held has to walk the text in the same direction that releasing Shift and
 /// pressing the same arrow would move the cursor.
-fn promptSelectionMove(event: input.KeyEvent, rtl: bool) ?PromptSelectionMove {
-    switch (event.action) {
-        .press, .repeat => {},
-        .release => return null,
-    }
-
-    const mods = event.mods.binding();
-    if (!mods.shift) return null;
-    if (mods.ctrl or mods.super) return null;
-
-    const visual_left = switch (event.key) {
-        .arrow_left => true,
-        .arrow_right => false,
-        else => return null,
-    };
-
-    // Screen direction to logical direction.
+fn promptSelectionMoveFor(
+    visual_left: bool,
+    word: bool,
+    rtl: bool,
+) PromptSelectionMove {
     const backward = if (rtl) !visual_left else visual_left;
-
     return .{
         .dir = if (backward) .backward else .forward,
-        // Option/Alt is the word-wise modifier on macOS, matching the
-        // word-motion binding users already have on Option+arrow.
-        .word = mods.alt,
+        .word = word,
     };
 }
 
@@ -5147,8 +5132,44 @@ fn promptSelectionMove(event: input.KeyEvent, rtl: bool) ?PromptSelectionMove {
 fn maybePromptSelectionMove(self: *Surface, event: input.KeyEvent) !bool {
     if (!self.config.selection_edit_at_prompt) return false;
 
+    // Cheap reject before taking the lock: most keys are not Shift+arrow.
+    switch (event.action) {
+        .press, .repeat => {},
+        .release => return false,
+    }
+    {
+        const mods = event.mods.binding();
+        if (!mods.shift) return false;
+        if (mods.ctrl or mods.super) return false;
+        switch (event.key) {
+            .arrow_left, .arrow_right => {},
+            else => return false,
+        }
+    }
+
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
+
+    return self.promptSelectionExtendLocked(
+        event.key == .arrow_left,
+        event.mods.binding().alt,
+    );
+}
+
+/// Extend or shrink the prompt selection for an arrow pressed with Shift.
+///
+/// `visual_left` names the direction on SCREEN; the logical direction is
+/// derived from the row. Split out from the key handler because Shift+arrow
+/// also arrives as the `adjust_selection` keybinding, and both entry points
+/// have to behave identically.
+///
+/// Requires the renderer state mutex is held.
+fn promptSelectionExtendLocked(
+    self: *Surface,
+    visual_left: bool,
+    word: bool,
+) !bool {
+    if (!self.config.selection_edit_at_prompt) return false;
 
     const t: *terminal.Terminal = self.renderer_state.terminal;
     const screen: *terminal.Screen = t.screens.active;
@@ -5159,8 +5180,11 @@ fn maybePromptSelectionMove(self: *Surface, event: input.KeyEvent) !bool {
     if (screen.cursor.semantic_content != .input and
         screen.cursor.page_cell.semantic_content != .input) return false;
 
-    const move = promptSelectionMove(event, self.cursorRowIsRtl()) orelse
-        return false;
+    const move = promptSelectionMoveFor(
+        visual_left,
+        word,
+        self.cursorRowIsRtl(),
+    );
 
     // The head is the end that moves; the anchor stays put.
     const cursor_pin = screen.cursor.page_pin.*;
@@ -6866,6 +6890,22 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
 
+            // Shift+Left/Right is bound to this action by default, so at a
+            // prompt it has to mean "grow the selection through the command
+            // line", not the screen-space adjustment below. Without this the
+            // binding swallows the key before the prompt handler ever sees
+            // it, which left plain Shift+arrow doing nothing useful while
+            // Shift+Option+arrow, which has no binding, worked fine.
+            switch (direction) {
+                .left, .right => {
+                    if (try self.promptSelectionExtendLocked(
+                        direction == .left,
+                        false,
+                    )) return true;
+                },
+                else => {},
+            }
+
             const screen: *terminal.Screen = self.io.terminal.screens.active;
             const sel = screen.adjustSelection(switch (direction) {
                 .left => .left,
@@ -8526,93 +8566,40 @@ test "Surface: prompt selection edit intent leaves commands alone" {
 test "Surface: shift+arrow direction maps by row direction" {
     const testing = std.testing;
 
-    // LTR: Shift+Left walks back through the command line, Shift+Right ahead.
-    {
-        const back = promptSelectionMove(.{
-            .action = .press,
-            .key = .arrow_left,
-            .mods = .{ .shift = true },
-        }, false).?;
-        try testing.expectEqual(terminal.Screen.PromptStep.backward, back.dir);
-        try testing.expect(!back.word);
-
-        const fwd = promptSelectionMove(.{
-            .action = .press,
-            .key = .arrow_right,
-            .mods = .{ .shift = true },
-        }, false).?;
-        try testing.expectEqual(terminal.Screen.PromptStep.forward, fwd.dir);
-    }
+    // LTR: Left walks back through the command line, Right walks ahead.
+    try testing.expectEqual(
+        terminal.Screen.PromptStep.backward,
+        promptSelectionMoveFor(true, false, false).dir,
+    );
+    try testing.expectEqual(
+        terminal.Screen.PromptStep.forward,
+        promptSelectionMoveFor(false, false, false).dir,
+    );
 
     // RTL: the same keys mean the opposite logical direction, because the
     // next character of a Hebrew line is drawn further left.
-    {
-        const fwd = promptSelectionMove(.{
-            .action = .press,
-            .key = .arrow_left,
-            .mods = .{ .shift = true },
-        }, true).?;
-        try testing.expectEqual(terminal.Screen.PromptStep.forward, fwd.dir);
-
-        const back = promptSelectionMove(.{
-            .action = .press,
-            .key = .arrow_right,
-            .mods = .{ .shift = true },
-        }, true).?;
-        try testing.expectEqual(terminal.Screen.PromptStep.backward, back.dir);
-    }
+    try testing.expectEqual(
+        terminal.Screen.PromptStep.forward,
+        promptSelectionMoveFor(true, false, true).dir,
+    );
+    try testing.expectEqual(
+        terminal.Screen.PromptStep.backward,
+        promptSelectionMoveFor(false, false, true).dir,
+    );
 }
 
-test "Surface: shift+option selects by word, and other keys are ignored" {
+test "Surface: shift+arrow word flag is independent of direction" {
     const testing = std.testing;
 
-    // Option is the word-wise modifier.
-    const word = promptSelectionMove(.{
-        .action = .press,
-        .key = .arrow_left,
-        .mods = .{ .shift = true, .alt = true },
-    }, false).?;
-    try testing.expect(word.word);
-    try testing.expectEqual(terminal.Screen.PromptStep.backward, word.dir);
-
-    // ...and it flips with the row like the plain form does.
-    const word_rtl = promptSelectionMove(.{
-        .action = .press,
-        .key = .arrow_left,
-        .mods = .{ .shift = true, .alt = true },
-    }, true).?;
-    try testing.expect(word_rtl.word);
-    try testing.expectEqual(terminal.Screen.PromptStep.forward, word_rtl.dir);
-
-    // No shift is ordinary cursor motion, not selection.
-    try testing.expect(promptSelectionMove(.{
-        .action = .press,
-        .key = .arrow_left,
-    }, false) == null);
-
-    // Ctrl and Cmd are other people's bindings.
-    try testing.expect(promptSelectionMove(.{
-        .action = .press,
-        .key = .arrow_left,
-        .mods = .{ .shift = true, .ctrl = true },
-    }, false) == null);
-    try testing.expect(promptSelectionMove(.{
-        .action = .press,
-        .key = .arrow_left,
-        .mods = .{ .shift = true, .super = true },
-    }, false) == null);
-
-    // Vertical arrows are history navigation.
-    try testing.expect(promptSelectionMove(.{
-        .action = .press,
-        .key = .arrow_up,
-        .mods = .{ .shift = true },
-    }, false) == null);
-
-    // Releases never move the selection.
-    try testing.expect(promptSelectionMove(.{
-        .action = .release,
-        .key = .arrow_left,
-        .mods = .{ .shift = true },
-    }, false) == null);
+    // Word-wise flips with the row exactly like the character form, so the
+    // two cannot disagree about which way "forward" is.
+    for ([_]bool{ false, true }) |rtl| {
+        for ([_]bool{ false, true }) |left| {
+            const plain = promptSelectionMoveFor(left, false, rtl);
+            const word = promptSelectionMoveFor(left, true, rtl);
+            try testing.expectEqual(plain.dir, word.dir);
+            try testing.expect(!plain.word);
+            try testing.expect(word.word);
+        }
+    }
 }
