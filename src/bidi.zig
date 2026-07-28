@@ -77,6 +77,110 @@ test "baseDirection: first strong char wins" {
     try testing.expectEqual(Direction.ltr, baseDirection(&.{ .whitespace, .european_number }));
 }
 
+/// Resolve weak types in place (UAX #9 W1-W7).
+///
+/// Runs before levels are assigned. Without this, every number separator is
+/// just another neutral, so N1 sees EN on both sides, resolves the separator
+/// RTL, and L2 tears the number apart: "1.5" renders as "5.1" and "192.168.1.1"
+/// comes out fully reversed on an RTL row.
+///
+/// `sos`/`eos` are both the base direction here: this subset has no explicit
+/// embeddings or isolates, so the whole row is one isolating run sequence.
+fn resolveWeak(classes: []Class, base: Direction) void {
+    const sos: Class = if (base == .rtl) .right_to_left else .left_to_right;
+
+    // W1: a nonspacing mark takes the class of the previous character.
+    for (classes, 0..) |*c, i| {
+        if (c.* != .nonspacing_mark) continue;
+        c.* = if (i == 0) sos else classes[i - 1];
+    }
+
+    // W2: an EN whose last strong context is AL becomes AN.
+    {
+        var last_strong: Class = sos;
+        for (classes) |*c| switch (c.*) {
+            .left_to_right,
+            .right_to_left,
+            .right_to_left_arabic,
+            => last_strong = c.*,
+            .european_number => if (last_strong == .right_to_left_arabic) {
+                c.* = .arabic_number;
+            },
+            else => {},
+        };
+    }
+
+    // W3: AL becomes R.
+    for (classes) |*c| {
+        if (c.* == .right_to_left_arabic) c.* = .right_to_left;
+    }
+
+    // W4: a single ES between two EN becomes EN; a single CS between two
+    // numbers of the same type becomes that type.
+    if (classes.len >= 3) {
+        var i: usize = 1;
+        while (i + 1 < classes.len) : (i += 1) {
+            const prev = classes[i - 1];
+            const next = classes[i + 1];
+            switch (classes[i]) {
+                .european_number_separator => if (prev == .european_number and
+                    next == .european_number)
+                {
+                    classes[i] = .european_number;
+                },
+                .common_number_separator => if (prev == next and
+                    (prev == .european_number or prev == .arabic_number))
+                {
+                    classes[i] = prev;
+                },
+                else => {},
+            }
+        }
+    }
+
+    // W5: a run of ET adjacent to an EN on either side becomes all EN.
+    {
+        var i: usize = 0;
+        while (i < classes.len) {
+            if (classes[i] != .european_number_terminator) {
+                i += 1;
+                continue;
+            }
+            var j = i;
+            while (j < classes.len and
+                classes[j] == .european_number_terminator) j += 1;
+            const before_en = i > 0 and classes[i - 1] == .european_number;
+            const after_en = j < classes.len and classes[j] == .european_number;
+            if (before_en or after_en) {
+                var k = i;
+                while (k < j) : (k += 1) classes[k] = .european_number;
+            }
+            i = j;
+        }
+    }
+
+    // W6: any separator or terminator left over becomes a plain neutral.
+    for (classes) |*c| switch (c.*) {
+        .european_number_separator,
+        .european_number_terminator,
+        .common_number_separator,
+        => c.* = .other_neutrals,
+        else => {},
+    };
+
+    // W7: an EN whose last strong context is L becomes L.
+    {
+        var last_strong: Class = sos;
+        for (classes) |*c| switch (c.*) {
+            .left_to_right, .right_to_left => last_strong = c.*,
+            .european_number => if (last_strong == .left_to_right) {
+                c.* = .left_to_right;
+            },
+            else => {},
+        };
+    }
+}
+
 /// A class is "neutral" if it has no inherent strong direction and must be
 /// resolved from surrounding context. For the M1 subset this includes the
 /// neutral and separator classes plus boundary neutrals.
@@ -303,7 +407,15 @@ pub fn resolveClasses(alloc: std.mem.Allocator, classes: []const Class, base: Di
     // Either way, bidi reverses each RTL run internally so words keep correct
     // letter order. We deliberately do NOT auto-pick base from first-strong;
     // the direction is a user toggle, not content-derived.
-    resolveLevels(classes, base, levels);
+    //
+    // W1-W7 rewrite the weak classes (number separators and terminators,
+    // nonspacing marks) before levels are assigned, so we work on a copy.
+    const weak = try alloc.alloc(Class, classes.len);
+    defer alloc.free(weak);
+    @memcpy(weak, classes);
+    resolveWeak(weak, base);
+
+    resolveLevels(weak, base, levels);
     reorder(levels, visual);
 
     return .{ .levels = levels, .visual = visual, .base = base };
@@ -361,4 +473,127 @@ test "resolveClasses: hyphenated LTR word in an RTL row stays contiguous" {
     // The whole Latin span (including the hyphen) is drawn left-to-right at
     // the left of the row, then the space, then the Hebrew read right-to-left.
     try testing.expectEqualSlices(u16, &.{ 3, 4, 5, 6, 7, 8, 2, 1, 0 }, res.visual);
+}
+
+test "resolveWeak: W4 keeps a decimal number together" {
+    // "1.5": CS between two EN becomes EN, so the whole number is one run.
+    var classes = [_]Class{ .european_number, .common_number_separator, .european_number };
+    resolveWeak(&classes, .rtl);
+    try testing.expectEqualSlices(Class, &.{
+        .european_number,
+        .european_number,
+        .european_number,
+    }, &classes);
+}
+
+test "resolveWeak: W4 keeps a hyphenated number together" {
+    var classes = [_]Class{
+        .european_number,
+        .european_number_separator,
+        .european_number,
+    };
+    resolveWeak(&classes, .rtl);
+    try testing.expectEqualSlices(Class, &.{
+        .european_number,
+        .european_number,
+        .european_number,
+    }, &classes);
+}
+
+test "resolveWeak: W4 does not join a separator that lacks a number on both sides" {
+    // "1- " -> the ES has no trailing EN, so W6 demotes it to a neutral.
+    var classes = [_]Class{
+        .european_number,
+        .european_number_separator,
+        .whitespace,
+    };
+    resolveWeak(&classes, .rtl);
+    try testing.expectEqualSlices(Class, &.{
+        .european_number,
+        .other_neutrals,
+        .whitespace,
+    }, &classes);
+}
+
+test "resolveWeak: W5 absorbs a terminator next to a number" {
+    // "50%" and "$50".
+    var suffix = [_]Class{ .european_number, .european_number_terminator };
+    resolveWeak(&suffix, .rtl);
+    try testing.expectEqualSlices(Class, &.{
+        .european_number,
+        .european_number,
+    }, &suffix);
+
+    var prefix = [_]Class{ .european_number_terminator, .european_number };
+    resolveWeak(&prefix, .rtl);
+    try testing.expectEqualSlices(Class, &.{
+        .european_number,
+        .european_number,
+    }, &prefix);
+}
+
+test "resolveWeak: W6 demotes a lone terminator" {
+    var classes = [_]Class{
+        .left_to_right,
+        .european_number_terminator,
+        .left_to_right,
+    };
+    resolveWeak(&classes, .rtl);
+    try testing.expectEqualSlices(Class, &.{
+        .left_to_right,
+        .other_neutrals,
+        .left_to_right,
+    }, &classes);
+}
+
+test "resolveWeak: W2/W3 map arabic context and letters" {
+    // AL then EN -> the number is AN, and the AL itself becomes R.
+    var classes = [_]Class{ .right_to_left_arabic, .european_number };
+    resolveWeak(&classes, .rtl);
+    try testing.expectEqualSlices(Class, &.{
+        .right_to_left,
+        .arabic_number,
+    }, &classes);
+}
+
+test "resolveWeak: W7 folds a number into a preceding LTR context" {
+    var classes = [_]Class{ .left_to_right, .european_number };
+    resolveWeak(&classes, .rtl);
+    try testing.expectEqualSlices(Class, &.{
+        .left_to_right,
+        .left_to_right,
+    }, &classes);
+}
+
+test "resolveWeak: W1 copies the previous class onto a nonspacing mark" {
+    var classes = [_]Class{ .right_to_left, .nonspacing_mark };
+    resolveWeak(&classes, .rtl);
+    try testing.expectEqualSlices(Class, &.{
+        .right_to_left,
+        .right_to_left,
+    }, &classes);
+
+    // At the start of the row it takes sos, i.e. the base direction.
+    var leading = [_]Class{.nonspacing_mark};
+    resolveWeak(&leading, .rtl);
+    try testing.expectEqualSlices(Class, &.{.right_to_left}, &leading);
+}
+
+test "resolveClasses: a decimal number in an RTL row is not reversed" {
+    // "<hebrew> 1.5" used to render as "5.1" because the '.' resolved RTL and
+    // L2 reversed the digits with it.
+    const classes = [_]Class{
+        .right_to_left,
+        .whitespace,
+        .european_number,
+        .common_number_separator,
+        .european_number,
+    };
+    const res = try resolveClasses(testing.allocator, &classes, .rtl);
+    defer testing.allocator.free(res.levels);
+    defer testing.allocator.free(res.visual);
+
+    try testing.expectEqualSlices(u8, &.{ 1, 1, 2, 2, 2 }, res.levels);
+    // Number drawn left-to-right at the left of the row, Hebrew to its right.
+    try testing.expectEqualSlices(u16, &.{ 2, 3, 4, 1, 0 }, res.visual);
 }
