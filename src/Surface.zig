@@ -5107,22 +5107,56 @@ fn maybePromptSelectionMove(self: *Surface, event: input.KeyEvent) !bool {
     const move = promptSelectionMove(event, self.cursorRowIsRtl()) orelse
         return false;
 
-    // The head is the end that moves; the anchor stays put. A fresh selection
-    // anchors at the cursor, which is where the user's attention is.
+    // The head is the end that moves; the anchor stays put.
     const cursor_pin = screen.cursor.page_pin.*;
-    const anchor, const head = if (screen.selection) |sel|
-        .{ sel.start(), sel.end() }
-    else
-        .{ cursor_pin, cursor_pin };
 
+    const anchor, const from = if (screen.selection) |sel|
+        .{ sel.start(), sel.end() }
+    else anchor: {
+        // A fresh selection. The caret sits at the LEFT EDGE of the cursor
+        // cell, not on the cell, so which cell the selection starts from
+        // depends on which way it grows:
+        //
+        //   forward  - the cursor cell is the first thing selected
+        //   backward - the cursor cell is past the caret and must NOT be
+        //              selected; the cell before it is the first
+        //
+        // Getting this wrong is what made a backward selection swallow the
+        // space the cursor was parked on.
+        const first = switch (move.dir) {
+            .forward => cursor_pin,
+            .backward => screen.promptInputStep(cursor_pin, .backward) orelse
+                return true,
+        };
+
+        // For a word selection, park the anchor on the word rather than on
+        // the whitespace between it and the caret, so the run of spaces the
+        // caret was sitting past is not dragged in.
+        break :anchor if (move.word)
+            .{ screen.promptInputSkipSpaces(first, move.dir), first }
+        else
+            .{ first, first };
+    };
+
+    // A fresh non-word selection is just the anchor cell itself.
+    if (screen.selection == null and !move.word) {
+        try self.setSelection(.init(anchor, anchor, false));
+        self.prompt_keyboard_selection = screen.selection;
+        return true;
+    }
+
+    const start = if (screen.selection == null) anchor else from;
     const next = if (move.word)
-        screen.promptInputStepWord(head, move.dir)
+        screen.promptInputStepWord(start, move.dir)
     else
-        screen.promptInputStep(head, move.dir);
+        screen.promptInputStep(start, move.dir);
 
     // Already at the end of the input. Consume the key anyway: letting it
     // through would move the shell's cursor out from under a live selection.
-    const new_head = next orelse return true;
+    const new_head = next orelse if (screen.selection == null)
+        anchor
+    else
+        return true;
 
     // Stepping back onto the anchor means the selection is empty again.
     if (new_head.eql(anchor) and screen.selection != null) {

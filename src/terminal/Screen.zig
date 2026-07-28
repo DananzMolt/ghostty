@@ -3485,18 +3485,35 @@ pub fn promptInputStepWord(
         cur = self.promptInputStep(cur, dir) orelse return cur;
     }
 
-    // Cross the word itself, stopping on its far edge.
+    // Cross the word itself, stopping on its far edge. Always the last
+    // character of the word, never the separator past it: a word selection
+    // should contain the word and nothing else.
     while (true) {
         const next = self.promptInputStep(cur, dir) orelse return cur;
-        if (isSpace(next)) return switch (dir) {
-            // Going forward we stop ON the trailing space, so the word plus
-            // its separator is covered, the same as a forward word motion.
-            .forward => next,
-            // Going backward we stop on the word's first character rather
-            // than the space before it.
-            .backward => cur,
-        };
+        if (isSpace(next)) return cur;
         cur = next;
+    }
+}
+
+/// Skip backwards over any run of spaces, returning the first non-space
+/// position at or before `from`, or `from` itself if it is not a space.
+///
+/// Used to place a selection anchor: the caret often sits just past a word,
+/// and a selection growing away from it should start at the word rather than
+/// swallow the whitespace in between.
+pub fn promptInputSkipSpaces(
+    self: *const Screen,
+    from: Pin,
+    dir: PromptStep,
+) Pin {
+    var cur = from;
+    while (true) {
+        const cell = cur.rowAndCell().cell;
+        const is_space = !cell.hasText() or
+            cell.codepoint() == ' ' or
+            cell.codepoint() == '\t';
+        if (!is_space) return cur;
+        cur = self.promptInputStep(cur, dir) orelse return cur;
     }
 }
 
@@ -11352,4 +11369,52 @@ test "Screen: promptLineMove counts leftward too" {
     const move = s.promptLineMove(target);
     try testing.expectEqual(@as(usize, 0), move.right);
     try testing.expectEqual(@as(usize, 3), move.left);
+}
+
+test "Screen: promptInputStepWord stops on the word, not the separator" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 40, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    //                    col: 2345678901234
+    try s.testWriteString("da asd asda");
+
+    // Backward from the final 'a' of "asda" lands on the 'a' that starts it,
+    // never on the space before it.
+    const from = s.pages.pin(.{ .active = .{ .x = 12, .y = 0 } }).?;
+    const back = s.promptInputStepWord(from, .backward).?;
+    try testing.expectEqual(@as(usize, 9), back.x);
+
+    // Forward from the 'd' of "da" lands on the last letter of "asd",
+    // not on the space that follows it.
+    const from2 = s.pages.pin(.{ .active = .{ .x = 3, .y = 0 } }).?;
+    const fwd = s.promptInputStepWord(from2, .forward).?;
+    try testing.expectEqual(@as(usize, 7), fwd.x);
+}
+
+test "Screen: promptInputSkipSpaces walks off the whitespace" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 40, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("da asd");
+
+    // Sitting on the space at column 4, skipping backward reaches the 'a'
+    // that ends "da" at column 3.
+    const space = s.pages.pin(.{ .active = .{ .x = 4, .y = 0 } }).?;
+    try testing.expectEqual(@as(usize, 3), s.promptInputSkipSpaces(space, .backward).x);
+
+    // A non-space is already where it needs to be.
+    const letter = s.pages.pin(.{ .active = .{ .x = 5, .y = 0 } }).?;
+    try testing.expectEqual(@as(usize, 5), s.promptInputSkipSpaces(letter, .backward).x);
 }
