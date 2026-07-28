@@ -3397,6 +3397,43 @@ fn promptClickLine(self: *Screen, click_pin: Pin) PromptClickMove {
     return .{ .left = count, .right = 0 };
 }
 
+/// Count the editable positions covered by the inclusive cell range
+/// [start, end].
+///
+/// This uses the same accounting as `promptClickMove`: only OSC 133 input
+/// cells count, and a wide character's spacer is not its own position. So a
+/// count returned here is directly comparable to the arrow-key counts that
+/// function produces, which is what lets a caller move the cursor to `start`
+/// and then delete exactly this many positions.
+///
+/// Returns 0 if `end` is before `start`.
+pub fn promptInputCellCount(self: *const Screen, start: Pin, end: Pin) usize {
+    _ = self;
+    if (end.before(start)) return 0;
+
+    var count: usize = 0;
+    var row_it = start.rowIterator(.right_down, end);
+    while (row_it.next()) |row_pin| {
+        const rac = row_pin.rowAndCell();
+        const cells = row_pin.node.page().getCells(rac.row);
+
+        // Clamp to the range on the first and last rows; full rows between.
+        const from: usize = if (row_pin.node == start.node and
+            row_pin.y == start.y) start.x else 0;
+        const to: usize = if (row_pin.node == end.node and
+            row_pin.y == end.y) @min(end.x + 1, cells.len) else cells.len;
+        if (from >= to) continue;
+
+        for (cells[from..to]) |cell| {
+            if (cell.semantic_content != .input) continue;
+            if (cell.wide.spacer()) continue;
+            count += 1;
+        }
+    }
+
+    return count;
+}
+
 /// Dump the screen to a string. The writer given should be buffered;
 /// this function does not attempt to efficiently write and generally writes
 /// one byte at a time.
@@ -11064,6 +11101,78 @@ test "Screen: promptClickMove click right of input cursor on last char" {
 
     try testing.expectEqual(@as(usize, 1), result.right);
     try testing.expectEqual(@as(usize, 0), result.left);
+}
+
+test "Screen: promptInputCellCount counts an inclusive input range" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("hello");
+
+    // "ell" -> columns 3..5 inclusive.
+    const start = s.pages.pin(.{ .active = .{ .x = 3, .y = 0 } }).?;
+    const end = s.pages.pin(.{ .active = .{ .x = 5, .y = 0 } }).?;
+    try testing.expectEqual(@as(usize, 3), s.promptInputCellCount(start, end));
+
+    // A single cell is one position.
+    try testing.expectEqual(@as(usize, 1), s.promptInputCellCount(start, start));
+}
+
+test "Screen: promptInputCellCount skips the prompt itself" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("hi");
+
+    // Span the whole row: only the two input cells count, not "> ".
+    const start = s.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?;
+    const end = s.pages.pin(.{ .active = .{ .x = 19, .y = 0 } }).?;
+    try testing.expectEqual(@as(usize, 2), s.promptInputCellCount(start, end));
+}
+
+test "Screen: promptInputCellCount counts a wide character once" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    // Two wide characters occupy four cells but are two positions to a shell.
+    try s.testWriteString("你好");
+
+    const start = s.pages.pin(.{ .active = .{ .x = 2, .y = 0 } }).?;
+    const end = s.pages.pin(.{ .active = .{ .x = 5, .y = 0 } }).?;
+    try testing.expectEqual(@as(usize, 2), s.promptInputCellCount(start, end));
+}
+
+test "Screen: promptInputCellCount returns zero for a reversed range" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("hello");
+
+    const start = s.pages.pin(.{ .active = .{ .x = 4, .y = 0 } }).?;
+    const end = s.pages.pin(.{ .active = .{ .x = 1, .y = 0 } }).?;
+    try testing.expectEqual(@as(usize, 0), s.promptInputCellCount(start, end));
 }
 
 test "Screen: promptClickMove does not give a wide character two arrows" {

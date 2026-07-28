@@ -401,6 +401,7 @@ const DerivedConfig = struct {
     middle_click_action: configpkg.MiddleClickAction,
     confirm_close_surface: configpkg.ConfirmCloseSurface,
     cursor_click_to_move: bool,
+    selection_edit_at_prompt: bool,
     desktop_notifications: bool,
     font: font.SharedGridSet.DerivedConfig,
     mouse_interval: u64,
@@ -489,6 +490,7 @@ const DerivedConfig = struct {
             .middle_click_action = config.@"middle-click-action",
             .confirm_close_surface = config.@"confirm-close-surface",
             .cursor_click_to_move = config.@"cursor-click-to-move",
+            .selection_edit_at_prompt = config.@"selection-edit-at-prompt",
             .desktop_notifications = config.@"desktop-notifications",
             .font = try font.SharedGridSet.DerivedConfig.init(alloc, config),
             .mouse_interval = config.@"click-repeat-interval" * 1_000_000, // 500ms
@@ -3353,9 +3355,23 @@ pub fn keyCallback(
         break :event copy;
     };
 
+    // If there's a selection at the prompt, this key may need to delete it
+    // first so that typing replaces it the way it would in a text editor.
+    // Must run before encodeKey, which takes the renderer lock itself.
+    const prompt_selection_edit = self.maybePromptSelectionEdit(event) catch |err| edit: {
+        log.warn("error editing prompt selection err={}", .{err});
+        break :edit .none;
+    };
+
     // Encode and send our key. If we didn't encode anything, then we
     // return the effect as ignored.
-    if (try self.encodeKey(
+    //
+    // Backspace/delete over a prompt selection is the exception: deleting the
+    // selection was the whole request, so encoding the key as well would eat
+    // one more character. We still fall through to the bookkeeping below.
+    if (prompt_selection_edit == .deleted) {
+        // Deleting the selection already wrote to the pty.
+    } else if (try self.encodeKey(
         event,
         if (insp_ev) |*ev| ev else null,
     )) |write_req| {
@@ -5000,6 +5016,162 @@ fn maybePromptClick(self: *Surface) !bool {
 
     return true;
 }
+
+/// What a key press should do about an active prompt selection.
+pub const PromptSelectionEdit = enum {
+    /// Nothing happened. Encode the key normally.
+    none,
+
+    /// The selection was deleted and the key should still be encoded, so it
+    /// lands as an insert where the selection used to be.
+    replaced,
+
+    /// The selection was deleted and the key must NOT be encoded, because
+    /// deleting the selection *is* what the key asked for.
+    deleted,
+};
+
+/// Classify a key press for `maybePromptSelectionEdit`. Pure; no terminal
+/// state is consulted, so this can run before taking the renderer lock.
+fn promptSelectionEditIntent(event: input.KeyEvent) PromptSelectionEdit {
+    // Repeats count: holding backspace over a selection should delete it on
+    // the first repeat and then behave normally once it is gone.
+    switch (event.action) {
+        .press, .repeat => {},
+        .release => return .none,
+    }
+
+    // Anything with a control-ish modifier is a command (kill-line, word
+    // motion, a keybind), not text entry. Shift is fine: it makes capitals.
+    const mods = event.mods.binding();
+    if (mods.ctrl or mods.alt or mods.super) return .none;
+
+    switch (event.key) {
+        .backspace, .delete => return .deleted,
+        else => {},
+    }
+
+    // Text entry only. `utf8` is empty for keys that produce no text, and we
+    // reject C0 so enter/tab/escape keep their normal meaning.
+    if (event.utf8.len == 0) return .none;
+    for (event.utf8) |b| if (b < 0x20 or b == 0x7F) return .none;
+
+    return .replaced;
+}
+
+/// Make a selection at a prompt behave like a selection in a text editor:
+/// typing over it replaces it, backspace and delete remove it.
+///
+/// The terminal cannot ask the shell to do this; nothing in the protocol
+/// expresses "replace the selection", and the shell does not know a selection
+/// exists. So we emulate it with the same mechanism `maybePromptClick` uses:
+/// arrow keys to move the cursor to the start of the selection, then one
+/// forward delete per selected position. The caller then encodes the original
+/// key, which inserts at the now-empty spot.
+///
+/// Returns `.none` and touches nothing unless the selection lies entirely
+/// within the current prompt's input.
+fn maybePromptSelectionEdit(self: *Surface, event: input.KeyEvent) !PromptSelectionEdit {
+    if (!self.config.selection_edit_at_prompt) return .none;
+
+    const intent = promptSelectionEditIntent(event);
+    if (intent == .none) return .none;
+
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const t: *terminal.Terminal = self.renderer_state.terminal;
+    const screen: *terminal.Screen = t.screens.active;
+
+    // We drive this with synthetic arrow keys, so we need the shell to have
+    // advertised the `cl` click option. `click_events` shells resolve clicks
+    // themselves and have no equivalent for a ranged delete.
+    switch (screen.semantic_prompt.click) {
+        .cl => {},
+        .none, .click_events => return .none,
+    }
+
+    // Only at a prompt. Inside a full-screen application the selection is
+    // ours alone and the application owns its own editing.
+    if (!t.cursorIsAtPrompt()) return .none;
+
+    // The cursor must be sitting on input. This is the same condition
+    // `promptClickMove` requires, and it matters here for a reason it does
+    // not there: that function reports "no movement" when it fails, which is
+    // indistinguishable from "already in the right place". Deleting on that
+    // answer would delete from wherever the cursor happens to be.
+    if (screen.cursor.semantic_content != .input and
+        screen.cursor.page_cell.semantic_content != .input) return .none;
+
+    const sel = screen.selection orelse return .none;
+
+    // A rectangle selection is not a run of input positions.
+    if (sel.rectangle) return .none;
+
+    // On a right-to-left row the selection is contiguous on screen but its
+    // logical positions are not, so a single ranged delete would remove the
+    // wrong text. Leave the selection copy-only until the mouse path maps
+    // visual columns back to logical cells.
+    if (self.cursorRowIsRtl()) return .none;
+
+    const tl = sel.topLeft(screen);
+    const br = sel.bottomRight(screen);
+
+    // Both ends must be input. This is what keeps command output, the prompt
+    // text itself, and earlier scrollback copy-only.
+    if (tl.rowAndCell().cell.semantic_content != .input) return .none;
+    if (br.rowAndCell().cell.semantic_content != .input) return .none;
+
+    // The selection must belong to the prompt the cursor is sitting in, not
+    // an older one still on screen.
+    const prompt_pin: terminal.Pin = prompt_pin: {
+        var it = screen.cursor.page_pin.promptIterator(.left_up, null);
+        break :prompt_pin it.next() orelse return .none;
+    };
+    if (tl.before(prompt_pin)) return .none;
+
+    const count = screen.promptInputCellCount(tl, br);
+    if (count == 0) return .none;
+
+    // A command line long enough to blow past this is not something we
+    // should be driving one keystroke at a time.
+    if (count > max_prompt_selection_edit) return .none;
+
+    const move = screen.promptClickMove(tl);
+
+    const left_arrow = if (t.modes.get(.cursor_keys)) "\x1bOD" else "\x1b[D";
+    const right_arrow = if (t.modes.get(.cursor_keys)) "\x1bOC" else "\x1b[C";
+    const forward_delete = "\x1b[3~";
+
+    // Build one write. Queuing per keystroke would put hundreds of messages
+    // on the IO thread for a long selection and let the shell redraw between
+    // them.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(self.alloc);
+    try buf.ensureTotalCapacity(
+        self.alloc,
+        (move.left + move.right) * 3 + count * forward_delete.len,
+    );
+    for (0..move.left) |_| buf.appendSliceAssumeCapacity(left_arrow);
+    for (0..move.right) |_| buf.appendSliceAssumeCapacity(right_arrow);
+    for (0..count) |_| buf.appendSliceAssumeCapacity(forward_delete);
+
+    self.queueIo(
+        try termio.Message.writeReq(self.alloc, buf.items),
+        .locked,
+    );
+
+    // The text it referred to is gone, so the selection has to go with it
+    // regardless of `selection-clear-on-typing`.
+    try self.setSelection(null);
+
+    return intent;
+}
+
+/// Upper bound on positions we will delete for one prompt selection edit.
+/// Generous next to any real command line, small enough that a corrupt
+/// screen state cannot turn one keystroke into an unbounded write.
+const max_prompt_selection_edit: usize = 10_000;
 
 const Link = struct {
     action: input.Link.Action,
@@ -8057,4 +8229,94 @@ test "Surface: oversized soft-wrapped URL candidate is rejected" {
             null,
         )) == null);
     }
+}
+
+test "Surface: prompt selection edit intent classifies typing and deletion" {
+    const testing = std.testing;
+
+    // Plain text replaces the selection, and the key still gets encoded.
+    try testing.expectEqual(PromptSelectionEdit.replaced, promptSelectionEditIntent(.{
+        .action = .press,
+        .key = .key_a,
+        .utf8 = "a",
+    }));
+
+    // Shift is text entry too.
+    try testing.expectEqual(PromptSelectionEdit.replaced, promptSelectionEditIntent(.{
+        .action = .press,
+        .key = .key_a,
+        .mods = .{ .shift = true },
+        .utf8 = "A",
+    }));
+
+    // Backspace and delete consume the key: removing the selection is the
+    // entire request, so the key must not also reach the shell.
+    try testing.expectEqual(PromptSelectionEdit.deleted, promptSelectionEditIntent(.{
+        .action = .press,
+        .key = .backspace,
+    }));
+    try testing.expectEqual(PromptSelectionEdit.deleted, promptSelectionEditIntent(.{
+        .action = .press,
+        .key = .delete,
+    }));
+
+    // Held backspace still deletes the selection on the first repeat.
+    try testing.expectEqual(PromptSelectionEdit.deleted, promptSelectionEditIntent(.{
+        .action = .repeat,
+        .key = .backspace,
+    }));
+}
+
+test "Surface: prompt selection edit intent leaves commands alone" {
+    const testing = std.testing;
+
+    // Releases never edit.
+    try testing.expectEqual(PromptSelectionEdit.none, promptSelectionEditIntent(.{
+        .action = .release,
+        .key = .key_a,
+        .utf8 = "a",
+    }));
+
+    // Control-ish modifiers mean a command or a keybind, not text.
+    for ([_]input.Mods{
+        .{ .ctrl = true },
+        .{ .alt = true },
+        .{ .super = true },
+    }) |mods| {
+        try testing.expectEqual(PromptSelectionEdit.none, promptSelectionEditIntent(.{
+            .action = .press,
+            .key = .key_a,
+            .mods = mods,
+            .utf8 = "a",
+        }));
+        // ...including on backspace, where ctrl/alt mean kill-word.
+        try testing.expectEqual(PromptSelectionEdit.none, promptSelectionEditIntent(.{
+            .action = .press,
+            .key = .backspace,
+            .mods = mods,
+        }));
+    }
+
+    // Keys that produce no text (arrows, modifiers) do nothing.
+    try testing.expectEqual(PromptSelectionEdit.none, promptSelectionEditIntent(.{
+        .action = .press,
+        .key = .arrow_left,
+    }));
+
+    // Enter, tab and escape keep their own meaning rather than replacing.
+    try testing.expectEqual(PromptSelectionEdit.none, promptSelectionEditIntent(.{
+        .action = .press,
+        .key = .enter,
+        .utf8 = "\r",
+    }));
+    try testing.expectEqual(PromptSelectionEdit.none, promptSelectionEditIntent(.{
+        .action = .press,
+        .key = .tab,
+        .utf8 = "\t",
+    }));
+    try testing.expectEqual(PromptSelectionEdit.none, promptSelectionEditIntent(.{
+        .action = .press,
+        .key = .escape,
+        .utf8 = "\x1b",
+    }));
 }

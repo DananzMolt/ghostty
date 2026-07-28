@@ -930,6 +930,25 @@ palette: Palette = .{},
 /// behavior around edge cases is possible.
 @"cursor-click-to-move": bool = true,
 
+/// Lets a selection made at a prompt behave like a selection in a text
+/// editor: typing replaces it, and backspace or delete removes it.
+///
+/// A terminal has no protocol for this. The selection lives entirely in the
+/// terminal and the shell has never heard of it, so this is emulated: the
+/// terminal moves the cursor to the start of the selection with arrow keys,
+/// deletes the selected positions, and then lets your keystroke through.
+///
+/// Consequently this carries the same requirements and caveats as
+/// `cursor-click-to-move`, which it builds on. It needs `OSC 133` shell
+/// integration with the `cl` click option, it only applies to a selection
+/// that lies entirely inside the current prompt's input, and it does nothing
+/// while an application has taken over the screen (those own their own
+/// editing). Selections in command output remain copy-only.
+///
+/// Disabled on right-to-left rows, where a visually contiguous selection does
+/// not map to a contiguous run of input positions.
+@"selection-edit-at-prompt": bool = true,
+
 /// Hide the mouse immediately when typing. The mouse becomes visible again
 /// when the mouse is used (button, movement, etc.). Platform-specific behavior
 /// may dictate other scenarios where the mouse is shown. For example on macOS,
