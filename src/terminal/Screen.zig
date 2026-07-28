@@ -3317,8 +3317,12 @@ fn promptClickLine(self: *Screen, click_pin: Pin) PromptClickMove {
                 // areas.
                 if (cell.semantic_content != .input) continue;
 
-                // Increment our input count
-                count += 1;
+                // Increment our input count. A wide character covers two
+                // cells but is a single position to the shell, so its
+                // spacer must not earn its own arrow key. We still let the
+                // spacer match the target below, so clicking either half
+                // of a wide character lands in the same place.
+                if (!cell.wide.spacer()) count += 1;
 
                 // If this is our target, we're done.
                 if (row_pin.node == click_pin.node and
@@ -3375,8 +3379,9 @@ fn promptClickLine(self: *Screen, click_pin: Pin) PromptClickMove {
             // Ignore non-input cells.
             if (cell.semantic_content != .input) continue;
 
-            // Increment our input count
-            count += 1;
+            // Increment our input count, skipping wide-character spacers
+            // which are not separate positions to the shell.
+            if (!cell.wide.spacer()) count += 1;
 
             // If this is our target, we're done.
             if (row_pin.node == click_pin.node and
@@ -11058,5 +11063,31 @@ test "Screen: promptClickMove click right of input cursor on last char" {
     const result = s.promptClickMove(click_pin);
 
     try testing.expectEqual(@as(usize, 1), result.right);
+    try testing.expectEqual(@as(usize, 0), result.left);
+}
+
+test "Screen: promptClickMove does not give a wide character two arrows" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 0 });
+    defer s.deinit();
+
+    s.semantic_prompt.click = .{ .cl = .line };
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    // "你" spans columns 2-3, "好" spans 4-5, then "a" at 6.
+    try s.testWriteString("你好a");
+
+    // Park the cursor on the first wide character.
+    s.cursorAbsolute(2, 0);
+
+    // Reaching "a" crosses two wide characters, which is two shell
+    // positions, not the four cells they cover.
+    const click_pin = s.pages.pin(.{ .active = .{ .x = 6, .y = 0 } }).?;
+    const result = s.promptClickMove(click_pin);
+    try testing.expectEqual(@as(usize, 2), result.right);
     try testing.expectEqual(@as(usize, 0), result.left);
 }

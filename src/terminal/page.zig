@@ -2111,6 +2111,16 @@ pub const Cell = packed struct(u64) {
         /// Spacer at the end of a soft-wrapped line to indicate that a wide
         /// character is continued on the next line.
         spacer_head = 3,
+
+        /// True for the filler cells of a wide character. These occupy a
+        /// screen cell but are not a separate position to a line editor,
+        /// so anything counting editable positions must skip them.
+        pub fn spacer(self: Wide) bool {
+            return switch (self) {
+                .spacer_tail, .spacer_head => true,
+                .narrow, .wide => false,
+            };
+        }
     };
 
     pub const SemanticContent = enum(u2) {
