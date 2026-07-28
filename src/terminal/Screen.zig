@@ -3418,6 +3418,88 @@ pub fn promptLineMove(self: *Screen, target: Pin) PromptClickMove {
     return self.promptClickLine(target);
 }
 
+/// Direction of travel through a prompt's editable positions, in LOGICAL
+/// terms. `forward` is toward the end of the command line, whichever side of
+/// the screen that lands on for a right-to-left row.
+pub const PromptStep = enum { backward, forward };
+
+/// Step one editable position through the prompt's input, skipping prompt
+/// text, padding and wide-character spacers, and following soft wraps.
+///
+/// Returns null at the ends of the input, which is the caller's cue that a
+/// selection cannot extend further.
+pub fn promptInputStep(
+    self: *const Screen,
+    from: Pin,
+    dir: PromptStep,
+) ?Pin {
+    var it = switch (dir) {
+        .forward => from.cellIterator(.right_down, null),
+        .backward => from.cellIterator(.left_up, null),
+    };
+
+    // The iterator yields `from` itself first.
+    _ = it.next();
+
+    while (it.next()) |pin| {
+        const cell = pin.rowAndCell().cell;
+
+        // Leaving the input ends the walk. Trailing blanks on the row are
+        // not input, so this also stops at the end of what was typed.
+        if (cell.semantic_content != .input) return null;
+
+        // A wide character's spacer is the same position as its head.
+        if (cell.wide.spacer()) continue;
+
+        return pin;
+    }
+
+    _ = self;
+    return null;
+}
+
+/// Step one word through the prompt's input.
+///
+/// Word here means what a line editor means by it: skip any run of spaces,
+/// then cross the run of non-spaces beyond it. Landing rule differs by
+/// direction so that repeated steps march evenly, matching the behaviour of
+/// word-wise motion in a text editor.
+pub fn promptInputStepWord(
+    self: *const Screen,
+    from: Pin,
+    dir: PromptStep,
+) ?Pin {
+    const isSpace = struct {
+        fn f(p: Pin) bool {
+            const cell = p.rowAndCell().cell;
+            if (!cell.hasText()) return true;
+            const cp = cell.codepoint();
+            return cp == ' ' or cp == '\t';
+        }
+    }.f;
+
+    var cur = self.promptInputStep(from, dir) orelse return null;
+
+    // Skip the run of spaces between us and the next word.
+    while (isSpace(cur)) {
+        cur = self.promptInputStep(cur, dir) orelse return cur;
+    }
+
+    // Cross the word itself, stopping on its far edge.
+    while (true) {
+        const next = self.promptInputStep(cur, dir) orelse return cur;
+        if (isSpace(next)) return switch (dir) {
+            // Going forward we stop ON the trailing space, so the word plus
+            // its separator is covered, the same as a forward word motion.
+            .forward => next,
+            // Going backward we stop on the word's first character rather
+            // than the space before it.
+            .backward => cur,
+        };
+        cur = next;
+    }
+}
+
 /// Count the editable positions covered by the inclusive cell range
 /// [start, end].
 ///
