@@ -4395,11 +4395,34 @@ fn mouseReport(
     button: ?input.MouseButton,
     action: input.MouseAction,
     mods: input.Mods,
-    pos: apprt.CursorPos,
+    pos_: apprt.CursorPos,
 ) void {
     // Mouse reporting must be enabled by both config and terminal state
     assert(self.config.mouse_reporting);
     assert(self.io.terminal.flags.mouse_event != .none);
+
+    // Report the LOGICAL column, not the screen one.
+    //
+    // An application that takes over the screen addresses cells in its own
+    // column order and knows nothing about the bidi reordering we apply when
+    // drawing. Telling it the column the pointer is physically over makes it
+    // act on a different cell, and then it draws its own highlight there: a
+    // TUI selection over Hebrew lands somewhere other than where you dragged.
+    //
+    // The encoder derives the cell from pixels, so nudge the pixel into the
+    // middle of the logical cell rather than teaching it about bidi.
+    const pos: apprt.CursorPos = pos: {
+        if (!self.config.bidi) break :pos pos_;
+        const vp = self.posToViewport(pos_.x, pos_.y);
+        const logical = self.logicalViewportPoint(vp);
+        if (logical.x == vp.x) break :pos pos_;
+        const cell_w: f32 = @floatFromInt(self.size.cell.width);
+        const pad_l: f32 = @floatFromInt(self.size.padding.left);
+        break :pos .{
+            .x = pad_l + (@as(f32, @floatFromInt(logical.x)) + 0.5) * cell_w,
+            .y = pos_.y,
+        };
+    };
 
     // Build our encoding options.
     const encoding_opts: input.mouse_encode.Options = opts: {
