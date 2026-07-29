@@ -3903,10 +3903,7 @@ fn logicalViewportPoint(
     self: *Surface,
     vp: terminal.point.Coordinate,
 ) terminal.point.Coordinate {
-    if (!self.config.bidi) {
-        log.warn("bidi mouse: config.bidi is false, no conversion", .{});
-        return vp;
-    }
+    if (!self.config.bidi) return vp;
 
     const screen = self.io.terminal.screens.active;
     const row_pin = screen.pages.pin(.{ .viewport = .{
@@ -3943,13 +3940,7 @@ fn logicalViewportPoint(
     ) catch return vp) orelse return vp;
     defer map.deinit(self.alloc);
 
-    const logical = map.visualToLogical(vp.x) orelse {
-        log.warn("bidi mouse: no logical cell for visual x={} y={}", .{ vp.x, vp.y });
-        return vp;
-    };
-    log.warn("bidi mouse: visual x={} -> logical x={} (y={} width={} content={})", .{
-        vp.x, logical, vp.y, cells.len, content_len,
-    });
+    const logical = map.visualToLogical(vp.x) orelse return vp;
     return .{ .x = logical, .y = vp.y };
 }
 
