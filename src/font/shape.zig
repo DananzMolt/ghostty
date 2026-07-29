@@ -88,6 +88,14 @@ pub const RunOptions = struct {
     /// null disables bidi (run iteration behaves exactly as before).
     bidi_levels: ?[]const u8 = null,
 
+    /// Mirror horizontal arrows on this row even where UAX #9 would not.
+    ///
+    /// Set for rows whose arrow KEYS are mirrored. An application's own
+    /// "press <-" hint sits in a Latin run at an even level, so L4 leaves it
+    /// alone, and it then names the opposite of the key that performs it.
+    /// Mirroring the glyph keeps the hint and the key agreeing.
+    mirror_arrows: bool = false,
+
     /// Apply the font break configuration to the run.
     pub fn applyBreakConfig(
         self: *RunOptions,

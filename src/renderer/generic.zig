@@ -657,6 +657,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             cursor_color: ?configpkg.Config.TerminalColor,
             cursor_opacity: f64,
             cursor_hide_while_selecting: bool,
+            bidi_mirror_arrows: bool,
             cursor_text: ?configpkg.Config.TerminalColor,
             background: terminal.color.RGB,
             background_opacity: f64,
@@ -734,6 +735,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .cursor_text = config.@"cursor-text",
                     .cursor_opacity = @max(0, @min(1, config.@"cursor-opacity")),
                     .cursor_hide_while_selecting = config.@"cursor-hide-while-selecting",
+                    .bidi_mirror_arrows = config.@"bidi-mirror-arrows",
 
                     .background = config.background.toTerminalRGB(),
                     .foreground = config.foreground.toTerminalRGB(),
@@ -3056,6 +3058,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
             run_iter_opts.bidi_levels = bidi_levels;
+            // Mirror arrow hints only on rows that actually reordered, which
+            // are the rows whose arrow keys are mirrored too.
+            run_iter_opts.mirror_arrows = self.config.bidi_mirror_arrows and
+                self.config.bidi_direction == .rtl and
+                bidi_levels != null;
 
             var run_iter = self.font_shaper.runIterator(run_iter_opts);
             var shaper_run: ?font.shape.TextRun = try run_iter.next(self.alloc);

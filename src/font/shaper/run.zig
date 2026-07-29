@@ -344,8 +344,41 @@ pub const RunIterator = struct {
     fn mirroredCodepoint(self: *const RunIterator, cp: u21, i: usize) u21 {
         const levels = self.opts.bidi_levels orelse return cp;
         if (i >= levels.len) return cp;
-        if (levels[i] & 1 == 0) return cp;
+        if (levels[i] & 1 == 0) {
+            // Deliberate deviation from L4, paired with the one we already
+            // ship for the arrow keys: on a row whose arrows are mirrored, a
+            // horizontal arrow is mirrored too even in a left-to-right run.
+            // Otherwise an application's "press <-" hint names the opposite
+            // of the key that actually performs it.
+            if (self.opts.mirror_arrows and isHorizontalArrow(cp)) {
+                return bidi_mirror.mirror(cp) orelse cp;
+            }
+            return cp;
+        }
         return bidi_mirror.mirror(cp) orelse cp;
+    }
+
+    /// Arrows that denote a horizontal direction, and so read as an
+    /// instruction about which key to press.
+    ///
+    /// Kept to a short explicit list rather than everything mirrorable: this
+    /// runs against left-to-right text, where flipping brackets or quotes
+    /// would be plainly wrong.
+    fn isHorizontalArrow(cp: u21) bool {
+        return switch (cp) {
+            0x2190,
+            0x2192, // <- ->
+            0x21A9,
+            0x21AA, // hooked
+            0x21D0,
+            0x21D2, // double
+            0x27F5,
+            0x27F6, // long
+            0x2B05,
+            0x27A1, // heavy / emoji
+            => true,
+            else => false,
+        };
     }
 
     fn addCodepoint(self: *RunIterator, hasher: anytype, cp: u32, cluster: u32) !void {
@@ -454,4 +487,23 @@ fn comparableStyle(style: terminal.Style) terminal.Style {
     s.bg_color = .none;
 
     return s;
+}
+
+test "run: arrow hints mirror on a right-to-left row" {
+    const testing = std.testing;
+
+    // A hint like "press <-" sits in a Latin run, so its level is even and
+    // UAX #9 leaves it alone. On a row whose arrow KEYS are mirrored that
+    // makes the hint name the opposite of the key that performs it.
+    try testing.expect(RunIterator.isHorizontalArrow(0x2190)); // <-
+    try testing.expect(RunIterator.isHorizontalArrow(0x2192)); // ->
+
+    // Only horizontal arrows. Flipping brackets or quotes in left-to-right
+    // text would be plainly wrong, and vertical arrows say nothing about
+    // which of the two keys to press.
+    try testing.expect(!RunIterator.isHorizontalArrow('('));
+    try testing.expect(!RunIterator.isHorizontalArrow('"'));
+    try testing.expect(!RunIterator.isHorizontalArrow(0x2191)); // up
+    try testing.expect(!RunIterator.isHorizontalArrow(0x2193)); // down
+    try testing.expect(!RunIterator.isHorizontalArrow('a'));
 }

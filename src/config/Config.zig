@@ -942,6 +942,21 @@ palette: Palette = .{},
 /// need to see even mid-selection.
 @"cursor-hide-while-selecting": bool = true,
 
+/// Mirror horizontal arrows drawn on a right-to-left row.
+///
+/// Only meaningful with `bidi-direction = rtl`, which also mirrors the arrow
+/// KEYS on those rows: pressing the arrow that points along the reading
+/// direction moves back. An application's own hint, such as `press <-`, sits
+/// in a Latin run, so UAX #9 leaves the glyph alone and it ends up naming the
+/// opposite of the key that performs it.
+///
+/// This mirrors the glyph so the hint and the key agree. It is a deliberate
+/// deviation from UAX #9 rule L4, and it applies to arrows in left-to-right
+/// text too, so an arrow meaning direction rather than a keystroke (a diagram,
+/// `a -> b` in prose) also flips on those rows. Turn this off to follow the
+/// standard exactly.
+@"bidi-mirror-arrows": bool = true,
+
 /// Lets a selection made at a prompt behave like a selection in a text
 /// editor: typing replaces it, and backspace or delete removes it.
 ///
