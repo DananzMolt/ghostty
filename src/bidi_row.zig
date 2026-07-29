@@ -294,3 +294,73 @@ test "bidi_row: visualToLogical is the identity on a latin row" {
         );
     }
 }
+
+/// Given the row map, the set of screen columns a logical range paints on.
+fn paintedColumns(map: BidiRowMap, lo: u16, hi: u16, out: []bool) void {
+    @memset(out, false);
+    var i: u16 = lo;
+    while (i <= hi) : (i += 1) out[map.logical_to_visual[i]] = true;
+}
+
+test "bidi_row: a dragged span maps to a logical range that repaints that span" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Pure Hebrew row: the mapping is a reversal, so a dragged span should
+    // come back exactly.
+    const cps = [_]u21{ 0x05D0, 0x05D1, 0x05D2, 0x05D3, 0x05D4, 0x05D5 };
+    const cells_len: usize = 20;
+    const map = (try bidiRowMap(alloc, &cps, cells_len, true)).?;
+    defer map.deinit(alloc);
+
+    const a: u16 = 15;
+    const b: u16 = 17;
+    const la = map.visualToLogical(a).?;
+    const lb = map.visualToLogical(b).?;
+    const lo = @min(la, lb);
+    const hi = @max(la, lb);
+
+    var painted = [_]bool{false} ** 20;
+    paintedColumns(map, lo, hi, &painted);
+
+    for (0..cells_len) |c| {
+        const in_drag = c >= a and c <= b;
+        try testing.expectEqual(in_drag, painted[c]);
+    }
+}
+
+test "bidi_row: a dragged span repaints that span on a mixed row too" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // "Bro עברית xy": a Latin run and a Hebrew run on one row, so the map is
+    // piecewise rather than a plain reversal.
+    //
+    // Worth stating why this test exists. A logical selection range on a bidi
+    // row can in principle paint cells the user never dragged over, which is
+    // correct per UAX #9 and wrong for a terminal. That would have meant no
+    // coordinate fix could make drag selection behave, and the selection model
+    // itself needed replacing. It turns out not to be the case here: the
+    // dragged span comes back exactly. So when RTL drag selection misbehaves,
+    // the cause is a conversion that did not run, not the model.
+    const cps = [_]u21{
+        'B',    'r',    'o',    ' ',
+        0x05D0, 0x05D1, 0x05D2, ' ',
+        'x',    'y',
+    };
+    const cells_len: usize = 20;
+    const map = (try bidiRowMap(alloc, &cps, cells_len, true)).?;
+    defer map.deinit(alloc);
+
+    const a: u16 = 12;
+    const b: u16 = 15;
+    const la = map.visualToLogical(a).?;
+    const lb = map.visualToLogical(b).?;
+    var painted = [_]bool{false} ** 20;
+    paintedColumns(map, @min(la, lb), @max(la, lb), &painted);
+
+    for (0..cells_len) |c| {
+        const in_drag = c >= a and c <= b;
+        try testing.expectEqual(in_drag, painted[c]);
+    }
+}
