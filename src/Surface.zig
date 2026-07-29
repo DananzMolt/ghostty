@@ -3953,6 +3953,25 @@ fn logicalViewportPoint(
     return .{ .x = logical, .y = vp.y };
 }
 
+/// Whether a full-screen application has taken over, rather than a shell
+/// sitting at a prompt.
+///
+/// Mirroring the arrow keys is a line-editing convenience: on a mirrored row
+/// the cursor should move the way it looks like it moves. An application does
+/// not want it. It binds the arrows to its own commands and addresses its own
+/// layout in its own order, so swapping them makes its keys do the opposite of
+/// what its own on-screen hints say. Claude Code's "press <-" to go back is
+/// the case that surfaced this: the arrows were swapped underneath it, so the
+/// left arrow reached it as a right arrow.
+///
+/// Detected by the two things such applications do that a shell prompt does
+/// not: take the alternate screen, or ask for mouse events.
+fn applicationOwnsScreen(t: *const terminal.Terminal) bool {
+    if (t.screens.active_key == .alternate) return true;
+    if (t.flags.mouse_event != .none) return true;
+    return false;
+}
+
 /// Whether the row the cursor sits on is drawn right-to-left.
 ///
 /// The arrows mirror only on rows that are actually mirrored. A blanket swap
@@ -3994,7 +4013,9 @@ fn encodeKeyOpts(self: *const Surface) input.key_encode.Options {
     const t = &self.io.terminal;
 
     var opts: input.key_encode.Options = .fromTerminal(t);
-    opts.bidi_swap_arrows = self.config.bidi_swap_arrows and self.cursorRowIsRtl();
+    opts.bidi_swap_arrows = self.config.bidi_swap_arrows and
+        self.cursorRowIsRtl() and
+        !applicationOwnsScreen(t);
     if (comptime builtin.os.tag != .macos) return opts;
 
     opts.macos_option_as_alt = self.config.macos_option_as_alt orelse detect: {
