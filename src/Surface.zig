@@ -1407,7 +1407,7 @@ fn selectionScrollTick(self: *Surface) !void {
     const t: *terminal.Terminal = self.renderer_state.terminal;
 
     const selection = self.mouse.selection_gesture.autoscrollTick(t, .{
-        .viewport = pos_vp,
+        .viewport = self.logicalViewportPoint(pos_vp),
         .xpos = pos.x,
         .ypos = pos.y,
         .rectangle = SurfaceMouse.isRectangleSelectState(self.mouse.mods),
@@ -4996,7 +4996,7 @@ fn maybePromptClick(self: *Surface) !bool {
 
     // Get the pin for our mouse click.
     const pos = try self.rt_surface.getCursorPos();
-    const pos_vp = self.posToViewport(pos.x, pos.y);
+    const pos_vp = self.logicalViewportPoint(self.posToViewport(pos.x, pos.y));
     const click_pin: terminal.Pin = pin: {
         const pin = screen.pages.pin(.{
             .viewport = .{
@@ -5971,13 +5971,13 @@ pub fn cursorPosCallback(
         // All roads lead to requiring a re-render at this point.
         try self.queueRender();
 
-        // Convert to points
+        // Convert to points. This is the end of the selection that follows
+        // the pointer, so like the press it has to name a logical cell; a
+        // drag that mixed a logical anchor with a visual head selected a
+        // mirrored run on a right-to-left row.
         const screen: *terminal.Screen = t.screens.active;
         const pin = screen.pages.pin(.{
-            .viewport = .{
-                .x = pos_vp.x,
-                .y = pos_vp.y,
-            },
+            .viewport = self.logicalViewportPoint(pos_vp),
         }) orelse {
             if (comptime std.debug.runtime_safety) unreachable;
             return;
