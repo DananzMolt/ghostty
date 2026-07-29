@@ -3911,7 +3911,12 @@ fn logicalViewportPoint(
         .y = vp.y,
     } }) orelse return vp;
 
-    const cells = row_pin.cells(.all);
+    // Must match the renderer's row width exactly. It clamps to the grid
+    // columns, and the row map right-anchors by `width - content`, so a
+    // different width here shifts every column and the inverse stops being an
+    // inverse.
+    const all_cells = row_pin.cells(.all);
+    const cells = all_cells[0..@min(all_cells.len, self.io.terminal.cols)];
     if (cells.len == 0) return vp;
 
     // Content runs to the last cell with text, matching the renderer.
