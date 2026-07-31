@@ -5286,6 +5286,31 @@ pub const PromptSelectionEdit = enum {
     deleted,
 };
 
+/// `Terminal.cursorIsAtPrompt` without its alternate-screen veto.
+///
+/// That veto reads "an application owning the screen owns its own editing",
+/// and for an application that draws a composer silently it is still right:
+/// nothing here could find its input positions, so there is nothing to count
+/// arrows or deletes against.
+///
+/// But OSC 133 is recorded against whichever screen is active, so an
+/// application that marks its input with `B` is telling us exactly where those
+/// positions are, and the same arrow-and-delete emulation applies to it. Gate
+/// on the marking, not on which screen happens to be up. An application that
+/// emits no marks is refused either way, one guard later, because no cell of
+/// its composer is `.input`.
+///
+/// Every other condition in `maybePromptSelectionEdit` is unchanged, so on the
+/// primary screen this accepts exactly what it accepted before.
+fn cursorIsAtPromptInput(t: *terminal.Terminal) bool {
+    const cursor: *const terminal.Screen.Cursor = &t.screens.active.cursor;
+    if (cursor.page_row.semantic_prompt != .none) return true;
+    return switch (cursor.semantic_content) {
+        .input, .prompt => true,
+        .output => false,
+    };
+}
+
 /// Classify a key press for `maybePromptSelectionEdit`. Pure; no terminal
 /// state is consulted, so this can run before taking the renderer lock.
 fn promptSelectionEditIntent(event: input.KeyEvent) PromptSelectionEdit {
@@ -5346,9 +5371,9 @@ fn maybePromptSelectionEdit(self: *Surface, event: input.KeyEvent) !PromptSelect
     // honor (fish 4 advertises `click_events=1`, then ignores the injected
     // event while responding to arrow keys normally).
 
-    // Only at a prompt. Inside a full-screen application the selection is
-    // ours alone and the application owns its own editing.
-    if (!t.cursorIsAtPrompt()) return .none;
+    // Only at a prompt, where "prompt" means marked input rather than a
+    // particular screen. See `cursorIsAtPromptInput`.
+    if (!cursorIsAtPromptInput(t)) return .none;
 
     // The cursor must be sitting on input, because the arrow count is
     // measured from it. `promptLineMove` reports no movement both when it
@@ -8630,4 +8655,72 @@ test "Surface: shift+arrow word flag is independent of direction" {
             try testing.expect(word.word);
         }
     }
+}
+
+test "Surface: prompt input gate accepts a marking application on the alternate screen" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // An application takes the screen and marks its composer's input, the way
+    // a shell marks a command line. That marking is the whole basis for
+    // counting arrows and deletes, so it is enough to qualify.
+    try t.switchScreenMode(.@"1049", true);
+    try testing.expect(!cursorIsAtPromptInput(&t));
+
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try testing.expect(cursorIsAtPromptInput(&t));
+
+    // `Terminal.cursorIsAtPrompt` still refuses here. This function exists
+    // precisely to differ from it on this case.
+    try testing.expect(!t.cursorIsAtPrompt());
+}
+
+test "Surface: prompt input gate refuses an unmarked application" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // The overwhelmingly common case: a full-screen application that draws a
+    // composer as ordinary output and emits no OSC 133. Nothing here can find
+    // its input positions, so it must stay copy-only.
+    try t.switchScreenMode(.@"1049", true);
+    for ("> type here") |c| try t.print(c);
+
+    try testing.expect(!cursorIsAtPromptInput(&t));
+}
+
+test "Surface: prompt input gate matches cursorIsAtPrompt on the primary screen" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // Walking a whole prompt lifecycle: relaxing the screen check must not
+    // change a single verdict while the primary screen is up.
+    try testing.expectEqual(t.cursorIsAtPrompt(), cursorIsAtPromptInput(&t));
+
+    try t.semanticPrompt(.init(.prompt_start));
+    try testing.expectEqual(t.cursorIsAtPrompt(), cursorIsAtPromptInput(&t));
+    for ("$ ") |c| try t.print(c);
+
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try testing.expectEqual(t.cursorIsAtPrompt(), cursorIsAtPromptInput(&t));
+    for ("ls") |c| try t.print(c);
+
+    try t.semanticPrompt(.init(.end_input_start_output));
+    try testing.expectEqual(t.cursorIsAtPrompt(), cursorIsAtPromptInput(&t));
+
+    try t.linefeed();
+    try testing.expect(!t.cursorIsAtPrompt());
+    try testing.expectEqual(t.cursorIsAtPrompt(), cursorIsAtPromptInput(&t));
+
+    try t.linefeed();
+    try t.semanticPrompt(.init(.prompt_start));
+    try testing.expectEqual(t.cursorIsAtPrompt(), cursorIsAtPromptInput(&t));
 }

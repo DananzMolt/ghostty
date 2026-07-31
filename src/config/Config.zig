@@ -973,12 +973,13 @@ palette: Palette = .{},
 /// shell to resolve a click.
 ///
 /// It only applies to a selection lying entirely inside the current prompt's
-/// input, and does nothing while an application has taken over the screen
-/// (those own their own editing). Selections in command output stay
-/// copy-only.
+/// input. Selections in command output stay copy-only.
 ///
-/// Disabled on right-to-left rows, where a visually contiguous selection does
-/// not map to a contiguous run of input positions.
+/// The `B` mark, not the screen, is what decides this. A full-screen
+/// application that marks its input is edited the same way a shell prompt is;
+/// one that does not, which is nearly all of them today, is untouched, because
+/// no cell of the composer it drew is input. So an application that implements
+/// its own editing keeps it.
 @"selection-edit-at-prompt": bool = true,
 
 /// Hide the mouse immediately when typing. The mouse becomes visible again
